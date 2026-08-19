@@ -719,14 +719,6 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 }
 
 pub fn defaultChatUrl() []const u8 {
-    if (openai_compat.protocolEnabled()) {
-        if (io_mod.getenv(chat_url_env)) |override| {
-            if (openai_compat.isAllowedGatewayUrl(override)) return override;
-        }
-        if (io_mod.getenv(base_url_env)) |base| {
-            if (openai_compat.isAllowedGatewayUrl(base)) return openai_compat.derivedChatUrl(base);
-        }
-    }
     return chatUrl(default_chat_url);
 }
 

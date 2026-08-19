@@ -49,7 +49,7 @@ pub fn isAllowedGatewayUrl(url: []const u8) bool {
 }
 
 pub fn derivedChatUrl(base: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, base, "/");
+    const trimmed = std.mem.trimEnd(u8, base, "/");
     const suffix = if (std.mem.endsWith(u8, trimmed, "/v1"))
         "/chat/completions"
     else

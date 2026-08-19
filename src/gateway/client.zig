@@ -1178,7 +1178,18 @@ fn streamGatewayCompletionCoreWithOptions(
         .transport => request.retry_count,
     };
     const trace_ctx = request.trace_ctx;
-    const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
+    const request_url = blk: {
+        const raw = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
+        if (openai) {
+            if (io_mod.getenv("FX_GATEWAY_CHAT_URL")) |override| {
+                if (openai_compat.isAllowedGatewayUrl(override)) break :blk override;
+            }
+            if (io_mod.getenv("FX_GATEWAY_BASE_URL")) |base| {
+                if (openai_compat.isAllowedGatewayUrl(base)) break :blk openai_compat.derivedChatUrl(base);
+            }
+        }
+        break :blk raw;
+    };
     const uri = try std.Uri.parse(request_url);
 
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});

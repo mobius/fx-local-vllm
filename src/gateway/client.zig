@@ -1169,7 +1169,7 @@ fn streamGatewayCompletionCoreWithOptions(
     const model = request.model;
     const openai = openai_compat.protocolEnabled();
     const payload = if (openai)
-        try openai_compat.rewriteVercelBodyToOpenAi(alloc, request.payload)
+        try openai_compat.rewriteVercelBodyToOpenAiWithModel(alloc, request.payload, model)
     else
         request.payload;
     defer if (openai) alloc.free(payload);

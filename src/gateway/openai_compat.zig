@@ -84,6 +84,14 @@ fn isRfc1918Host(host: []const u8) bool {
 /// Rewrite Vercel AI Gateway `{prompt, tools, maxOutputTokens}` JSON into
 /// OpenAI-compatible `{messages, tools, max_tokens, stream}`.
 pub fn rewriteVercelBodyToOpenAi(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return rewriteVercelBodyToOpenAiWithModel(alloc, body, null);
+}
+
+pub fn rewriteVercelBodyToOpenAiWithModel(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    model_override: ?[]const u8,
+) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
         return alloc.dupe(u8, body);
     defer parsed.deinit();
@@ -95,12 +103,16 @@ pub fn rewriteVercelBodyToOpenAi(alloc: std.mem.Allocator, body: []const u8) ![]
     try out.writer.writeByte('{');
     var wrote_field = false;
 
-    if (root.get("model")) |model| {
-        if (model == .string) {
-            try writeComma(&out.writer, &wrote_field);
-            try out.writer.writeAll("\"model\":");
-            try std.json.Stringify.value(model.string, .{}, &out.writer);
-        }
+    const model_name: ?[]const u8 = if (model_override) |m|
+        m
+    else if (root.get("model")) |model|
+        if (model == .string) model.string else null
+    else
+        null;
+    if (model_name) |model| {
+        try writeComma(&out.writer, &wrote_field);
+        try out.writer.writeAll("\"model\":");
+        try std.json.Stringify.value(model, .{}, &out.writer);
     }
 
     const prompt = root.get("prompt") orelse root.get("messages");
@@ -427,6 +439,14 @@ test "rewrite maps prompt tools and maxOutputTokens" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"max_tokens\":4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"function\"") != null);
+}
+
+test "rewrite injects model override" {
+    const alloc = std.testing.allocator;
+    const src = "{\"prompt\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    const out = try rewriteVercelBodyToOpenAiWithModel(alloc, src, "demo-model");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"demo-model\"") != null);
 }
 
 test "rewrite flattens user content parts" {

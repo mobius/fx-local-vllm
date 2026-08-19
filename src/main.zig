@@ -477,7 +477,7 @@ const App = struct {
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
     selected_model: std.ArrayList(u8) = .empty,
-    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.activeModelsPath()),
+    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
@@ -488,7 +488,7 @@ const App = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_gateway.default_web_search_provider else null,
     }),
-    web_search_models_path: []const u8 = builtin_gateway.activeModelsPath(),
+    web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
@@ -561,6 +561,8 @@ const App = struct {
         var app = Self{
             .alloc = alloc,
             .lifecycle_runtime = hooks.Runtime.init(alloc),
+            .model_cache = model_cache_runtime.Runtime.init(alloc, builtin_gateway.activeModelsPath()),
+            .web_search_models_path = builtin_gateway.activeModelsPath(),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
             else

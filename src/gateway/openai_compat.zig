@@ -289,7 +289,7 @@ pub fn consumeOpenAiSse(
         const trimmed = std.mem.trim(u8, line, " \r");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-        var data = std.mem.trim(u8, trimmed["data:".len..], " ");
+        const data = std.mem.trim(u8, trimmed["data:".len..], " ");
         if (std.mem.eql(u8, data, "[DONE]")) break;
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch continue;
         defer parsed.deinit();
@@ -469,7 +469,7 @@ test "consumeOpenAiSse reads content and stop" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    var completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
+    const completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
     defer if (completion.content) |c| alloc.free(c);
     try std.testing.expectEqualStrings("pong", completion.content.?);
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);

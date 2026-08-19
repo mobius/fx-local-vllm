@@ -477,7 +477,7 @@ const App = struct {
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
     selected_model: std.ArrayList(u8) = .empty,
-    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.activeModelsPath()),
     workspace_root: []u8 = &.{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
@@ -488,7 +488,7 @@ const App = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_gateway.default_web_search_provider else null,
     }),
-    web_search_models_path: []const u8 = builtin_gateway.models_path,
+    web_search_models_path: []const u8 = builtin_gateway.activeModelsPath(),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
@@ -1682,7 +1682,7 @@ const App = struct {
         return AgentAppRuntime.fetchModelIds(
             self,
             if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
-            builtin_gateway.models_path,
+            builtin_gateway.activeModelsPath(),
         );
     }
 
@@ -3192,7 +3192,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
+        .models_path = builtin_gateway.activeModelsPath(),
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = builtin_gateway.provider,
@@ -3228,7 +3228,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
+        .models_path = builtin_gateway.activeModelsPath(),
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = builtin_gateway.provider,

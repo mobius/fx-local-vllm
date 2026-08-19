@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const openai_compat = @import("openai_compat.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -589,10 +590,11 @@ test "gateway JSON transport preserves non-success HTTP status" {
 
 fn gatewayBaseUrl() []const u8 {
     const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return default_gateway_base_url;
-    // The base URL carries the bearer token; only a loopback HTTP override is
-    // trusted for local testing.
+    // Default: loopback HTTP only. OpenAI-compatible mode may also allow
+    // RFC1918 HTTP when FX_GATEWAY_ALLOW_PRIVATE_HTTP=1.
+    if (openai_compat.isAllowedGatewayUrl(override)) return override;
     if (!isLoopbackHttpUrl(override)) {
-        debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not loopback http", .{});
+        debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not a trusted local http origin", .{});
         return default_gateway_base_url;
     }
     return override;
@@ -1165,7 +1167,12 @@ fn streamGatewayCompletionCoreWithOptions(
     core_options: StreamCoreOptions,
 ) !StreamResult {
     const model = request.model;
-    const payload = request.payload;
+    const openai = openai_compat.protocolEnabled();
+    const payload = if (openai)
+        try openai_compat.rewriteVercelBodyToOpenAi(alloc, request.payload)
+    else
+        request.payload;
+    defer if (openai) alloc.free(payload);
     const retry_count = switch (request.provider_attempt_owner) {
         .agent => 1,
         .transport => request.retry_count,
@@ -1387,19 +1394,28 @@ fn streamGatewayCompletionCoreWithOptions(
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
-        var completion = consumeSseStreamTraced(
-            alloc,
-            body_reader,
-            callback_ctx,
-            on_content_chunk,
-            on_tool_start,
-            request.on_reasoning_chunk,
-            request.on_tool_input_chunk,
-            cancel_flag,
-            .{ .requested_model = model, .ctx = trace_ctx },
-            expected_provider_tool_name,
-            request.content_capture_limit,
-        ) catch |err| {
+        var completion = (if (openai)
+            openai_compat.consumeOpenAiSse(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                cancel_flag,
+            )
+        else
+            consumeSseStreamTraced(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                .{ .requested_model = model, .ctx = trace_ctx },
+                expected_provider_tool_name,
+                request.content_capture_limit,
+            )) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
                 cancel_flag.load(.seq_cst),

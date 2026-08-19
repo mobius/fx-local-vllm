@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         .default_agent_step_limit = 64,
         .gateway_retry_count = 0,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_models_path = builtin_gateway.models_path,
+        .gateway_models_path = builtin_gateway.activeModelsPath(),
         .gateway_provider = js_host_gateway_provider,
         .background_process_provider = background_process_provider.unavailable_provider,
         .secret_store = host.unavailable_secret_store,

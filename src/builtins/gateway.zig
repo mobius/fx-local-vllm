@@ -12,6 +12,7 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
+const openai_compat = @import("../gateway/openai_compat.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -40,6 +41,11 @@ const ProgressFn = web_search_contract.ProgressFn;
 pub const default_model = "zai/glm-5.2";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
+
+pub fn activeModelsPath() []const u8 {
+    if (openai_compat.protocolEnabled()) return openai_compat.openai_models_path;
+    return models_path;
+}
 const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
@@ -647,7 +653,7 @@ fn validateApiKey(
     alloc: Allocator,
     api_key: []const u8,
 ) api_key_validator_contract.Result {
-    var result = gateway_client.fetchGatewayGetResult(alloc, api_key, models_path) catch |err| {
+    var result = gateway_client.fetchGatewayGetResult(alloc, api_key, activeModelsPath()) catch |err| {
         debug_trace.logf("auth", "api key validation failed err={s}", .{@errorName(err)});
         return .unavailable;
     };
@@ -713,6 +719,14 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 }
 
 pub fn defaultChatUrl() []const u8 {
+    if (openai_compat.protocolEnabled()) {
+        if (io_mod.getenv(chat_url_env)) |override| {
+            if (openai_compat.isAllowedGatewayUrl(override)) return override;
+        }
+        if (io_mod.getenv(base_url_env)) |base| {
+            if (openai_compat.isAllowedGatewayUrl(base)) return openai_compat.derivedChatUrl(base);
+        }
+    }
     return chatUrl(default_chat_url);
 }
 
@@ -751,10 +765,9 @@ fn fetchCliModelCatalog(
 
 pub fn resolveChatUrl(fallback: []const u8, override: ?[]const u8) []const u8 {
     const candidate = override orelse return fallback;
-    // The chat URL carries the bearer token and full request payload; only a
-    // loopback HTTP override is trusted for local testing.
-    if (!gateway_client.isLoopbackHttpUrl(candidate)) return fallback;
-    return candidate;
+    if (openai_compat.isAllowedGatewayUrl(candidate) or gateway_client.isLoopbackHttpUrl(candidate))
+        return candidate;
+    return fallback;
 }
 
 pub const StreamFn = *const fn (
@@ -2150,8 +2163,9 @@ test "catalog request failures preserve transport and cancellation facts" {
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
     const base_url = if (base_url_override) |candidate| blk: {
-        if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
-        debug_trace.logf("gateway", "ignoring {s}: not loopback http", .{base_url_env});
+        if (openai_compat.isAllowedGatewayUrl(candidate) or gateway_client.isLoopbackHttpUrl(candidate))
+            break :blk candidate;
+        debug_trace.logf("gateway", "ignoring {s}: not a trusted local http origin", .{base_url_env});
         break :blk default_model_catalog_base_url;
     } else default_model_catalog_base_url;
 

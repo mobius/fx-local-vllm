@@ -644,7 +644,7 @@ test "consumeOpenAiSse accumulates incremental IOA tool_calls" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    var completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
+    const completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
     defer {
         if (completion.content) |c| alloc.free(c);
         for (completion.tool_calls) |call| {

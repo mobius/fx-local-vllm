@@ -8,7 +8,7 @@ const protocol_env = "FX_GATEWAY_PROTOCOL";
 const allow_private_env = "FX_GATEWAY_ALLOW_PRIVATE_HTTP";
 const default_max_tokens: u32 = 8192;
 const qwen38_max_tokens: u32 = 16384;
-const ioa_max_tokens: u32 = 50000;
+const ioa_max_tokens: u32 = 16384;
 
 pub const openai_models_path = "/v1/models";
 
@@ -209,7 +209,17 @@ pub fn rewriteVercelBodyToOpenAiWithModel(
     }
 
     try out.writer.writeByte('}');
-    return out.toOwnedSlice();
+    const slice = try out.toOwnedSlice();
+    debug_trace.logf(
+        "stream",
+        "openai rewrite bytes={d} has_prompt={s} prefix={s}",
+        .{
+            slice.len,
+            if (std.mem.indexOf(u8, slice, "\"prompt\":") != null) "yes" else "no",
+            slice[0..@min(slice.len, 160)],
+        },
+    );
+    return slice;
 }
 
 fn isIoaFamily(model: []const u8) bool {
@@ -592,11 +602,11 @@ test "rewrite applies IOA flash max and pro low" {
     const src = "{\"prompt\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
     const flash = try rewriteVercelBodyToOpenAiWithModel(alloc, src, "deepseek-v4-flash-ioa");
     defer alloc.free(flash);
-    try std.testing.expect(std.mem.indexOf(u8, flash, "\"max_tokens\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flash, "\"max_tokens\":16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, flash, "\"reasoning_effort\":\"max\"") != null);
     const pro = try rewriteVercelBodyToOpenAiWithModel(alloc, src, "deepseek-v4-pro-ioa");
     defer alloc.free(pro);
-    try std.testing.expect(std.mem.indexOf(u8, pro, "\"max_tokens\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pro, "\"max_tokens\":16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, pro, "\"reasoning_effort\":\"low\"") != null);
 }
 

@@ -370,6 +370,92 @@ fn writeOpenAiTools(writer: *std.Io.Writer, tools: std.json.Value) !void {
     try writer.writeByte(']');
 }
 
+const ToolAcc = struct {
+    used: bool = false,
+    id: std.ArrayListUnmanaged(u8) = .empty,
+    name: std.ArrayListUnmanaged(u8) = .empty,
+    args: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ToolAcc, alloc: std.mem.Allocator) void {
+        self.id.deinit(alloc);
+        self.name.deinit(alloc);
+        self.args.deinit(alloc);
+    }
+};
+
+fn findFreeToolAcc(accs: []ToolAcc) ?*ToolAcc {
+    for (accs) |*acc| {
+        if (!acc.used) return acc;
+    }
+    return null;
+}
+
+fn applyToolCallDelta(
+    alloc: std.mem.Allocator,
+    accs: []ToolAcc,
+    tc: std.json.Value,
+) !void {
+    var idx: usize = 0;
+    if (tc.object.get("index")) |iv| {
+        if (iv == .integer and iv.integer >= 0) {
+            idx = @min(@as(usize, @intCast(iv.integer)), accs.len - 1);
+        }
+    }
+    const id_s: []const u8 = if (tc.object.get("id")) |id_v|
+        if (id_v == .string) id_v.string else ""
+    else
+        "";
+
+    var acc: *ToolAcc = &accs[idx];
+    if (id_s.len > 0) {
+        var found: ?*ToolAcc = null;
+        for (accs) |*candidate| {
+            if (candidate.used and std.mem.eql(u8, candidate.id.items, id_s)) {
+                found = candidate;
+                break;
+            }
+        }
+        if (found) |existing| {
+            acc = existing;
+        } else {
+            if (acc.used and acc.id.items.len > 0 and !std.mem.eql(u8, acc.id.items, id_s)) {
+                acc = findFreeToolAcc(accs) orelse acc;
+            }
+            acc.used = true;
+            acc.id.clearRetainingCapacity();
+            try acc.id.appendSlice(alloc, id_s);
+        }
+    } else {
+        acc.used = true;
+    }
+
+    const fn_v = tc.object.get("function") orelse return;
+    if (fn_v != .object) return;
+    if (fn_v.object.get("name")) |n| {
+        if (n == .string and n.string.len > 0) {
+            acc.name.clearRetainingCapacity();
+            try acc.name.appendSlice(alloc, n.string);
+        }
+    }
+    if (fn_v.object.get("arguments")) |a| {
+        if (a == .string and a.string.len > 0) {
+            if (a.string[0] == '{' and acc.args.items.len > 0) {
+                if (try types.ToolArgumentIntegrity.classifySerialized(alloc, acc.args.items) == .valid) {
+                    const next = findFreeToolAcc(accs) orelse acc;
+                    if (next != acc) {
+                        next.used = true;
+                        if (acc.name.items.len > 0 and next.name.items.len == 0) {
+                            try next.name.appendSlice(alloc, acc.name.items);
+                        }
+                        acc = next;
+                    }
+                }
+            }
+            try acc.args.appendSlice(alloc, a.string);
+        }
+    }
+}
+
 pub const StreamCallback = *const fn (*anyopaque, []const u8) void;
 
 /// Parse OpenAI `chat.completion.chunk` SSE into a GatewayCompletion.
@@ -398,12 +484,9 @@ pub fn consumeOpenAiSse(
     var input_tokens: ?u64 = null;
     var output_tokens: ?u64 = null;
 
-    var tool_id: std.ArrayListUnmanaged(u8) = .empty;
-    defer tool_id.deinit(alloc);
-    var tool_name: std.ArrayListUnmanaged(u8) = .empty;
-    defer tool_name.deinit(alloc);
-    var tool_args: std.ArrayListUnmanaged(u8) = .empty;
-    defer tool_args.deinit(alloc);
+    const MaxToolAcc = 8;
+    var accs: [MaxToolAcc]ToolAcc = [_]ToolAcc{.{}} ** MaxToolAcc;
+    defer for (&accs) |*acc| acc.deinit(alloc);
 
     while (true) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -461,33 +544,25 @@ pub fn consumeOpenAiSse(
             if (tcs == .array) {
                 for (tcs.array.items) |tc| {
                     if (tc != .object) continue;
-                    if (tc.object.get("id")) |id| {
-                        if (id == .string and id.string.len > 0) {
-                            tool_id.clearRetainingCapacity();
-                            try tool_id.appendSlice(alloc, id.string);
-                        }
-                    }
-                    const fn_v = tc.object.get("function") orelse continue;
-                    if (fn_v != .object) continue;
-                    if (fn_v.object.get("name")) |n| {
-                        if (n == .string and n.string.len > 0) {
-                            tool_name.clearRetainingCapacity();
-                            try tool_name.appendSlice(alloc, n.string);
-                        }
-                    }
-                    if (fn_v.object.get("arguments")) |a| {
-                        if (a == .string and a.string.len > 0) try tool_args.appendSlice(alloc, a.string);
-                    }
+                    try applyToolCallDelta(alloc, &accs, tc);
                 }
             }
         }
     }
 
-    if (tool_name.items.len > 0) {
+    for (&accs, 0..) |*acc, i| {
+        if (!acc.used or acc.name.items.len == 0) continue;
+        var args = acc.args.items;
+        if (args.len == 0) args = "{}";
+        if (try types.ToolArgumentIntegrity.classifySerialized(alloc, args) == .malformed_json) {
+            args = "{}";
+        }
+        var id_buf: [16]u8 = undefined;
+        const id = if (acc.id.items.len > 0) acc.id.items else std.fmt.bufPrint(&id_buf, "call_{d}", .{i}) catch "call_0";
         try tool_calls.append(alloc, .{
-            .id = try alloc.dupe(u8, if (tool_id.items.len > 0) tool_id.items else "call_0"),
-            .name = try alloc.dupe(u8, tool_name.items),
-            .arguments_json = try alloc.dupe(u8, tool_args.items),
+            .id = try alloc.dupe(u8, id),
+            .name = try alloc.dupe(u8, acc.name.items),
+            .arguments_json = try alloc.dupe(u8, args),
         });
         if (finish_reason == null or finish_reason == .stop) finish_reason = .tool_calls;
     }
@@ -681,6 +756,33 @@ test "consumeOpenAiSse accumulates incremental IOA tool_calls" {
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("list_dir", completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
+}
+
+test "consumeOpenAiSse splits two complete argument objects" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"index\":0,\"function\":{\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\":\\\"\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_b\",\"index\":0,\"function\":{\"name\":\"terminal\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    const completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
+    defer {
+        if (completion.content) |c| alloc.free(c);
+        for (completion.tool_calls) |call| {
+            alloc.free(call.id);
+            alloc.free(call.name);
+            alloc.free(call.arguments_json);
+        }
+        alloc.free(completion.tool_calls);
+    }
+    try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("list_files", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("terminal", completion.tool_calls[1].name);
 }
 
 test "consumeOpenAiSse reads content and stop" {

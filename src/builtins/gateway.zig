@@ -43,7 +43,7 @@ pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model"
 pub const models_path = "/coding-agent/v1/models";
 
 pub fn activeModelsPath() []const u8 {
-    if (openai_compat.protocolEnabled()) return openai_compat.openai_models_path;
+    if (openai_compat.protocolEnabled()) return openai_compat.openaiModelsPath();
     return models_path;
 }
 const credits_path = "/coding-agent/v1/credits";

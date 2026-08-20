@@ -20,7 +20,8 @@ Do not put real hosts, tokens, or team names in the repository.
 - Loopback HTTP is always allowed as a base override.
 - RFC1918 HTTP (`10/8`, `172.16/12`, `192.168/16`) requires `FX_GATEWAY_ALLOW_PRIVATE_HTTP=1` and `FX_GATEWAY_PROTOCOL=openai`.
 - Userinfo in the URL is rejected.
-- HTTPS public origins are not accepted as `FX_GATEWAY_BASE_URL` overrides (use the stock Vercel path for that).
+- HTTPS origins (no userinfo in the URL) are allowed when `FX_GATEWAY_PROTOCOL=openai`, so a second OpenAI-compatible HTTPS gateway can be used.
+- Bases ending in `/v1` or `/v2` append `/chat/completions` and `/models`.
 
 ## Protocol mapping
 

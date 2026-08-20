@@ -43,14 +43,31 @@ pub fn isPrivateLanHttpUrl(url: []const u8) bool {
     return isRfc1918Host(host);
 }
 
+pub fn isHttpsUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+    if (uri.user != null or uri.password != null) return false;
+    return uri.host != null;
+}
+
 pub fn isAllowedGatewayUrl(url: []const u8) bool {
     if (isLoopbackHttpUrl(url)) return true;
-    return protocolEnabled() and allowPrivateHttp() and isPrivateLanHttpUrl(url);
+    if (!protocolEnabled()) return false;
+    if (isHttpsUrl(url)) return true;
+    return allowPrivateHttp() and isPrivateLanHttpUrl(url);
+}
+
+pub fn openaiModelsPath() []const u8 {
+    const base = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return openai_models_path;
+    const trimmed = std.mem.trimEnd(u8, base, "/");
+    if (std.mem.endsWith(u8, trimmed, "/v1") or std.mem.endsWith(u8, trimmed, "/v2"))
+        return "/models";
+    return openai_models_path;
 }
 
 pub fn derivedChatUrl(base: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, base, "/");
-    const suffix = if (std.mem.endsWith(u8, trimmed, "/v1"))
+    const suffix = if (std.mem.endsWith(u8, trimmed, "/v1") or std.mem.endsWith(u8, trimmed, "/v2"))
         "/chat/completions"
     else
         "/v1/chat/completions";
@@ -476,6 +493,16 @@ test "derived chat url appends /v1/chat/completions once" {
         "http://127.0.0.1:8000/v1/chat/completions",
         derivedChatUrl("http://127.0.0.1:8000/v1"),
     );
+    try std.testing.expectEqualStrings(
+        "https://example.com/v2/chat/completions",
+        derivedChatUrl("https://example.com/v2"),
+    );
+}
+
+test "https origins are recognized" {
+    try std.testing.expect(isHttpsUrl("https://example.com/v2"));
+    try std.testing.expect(!isHttpsUrl("http://example.com/v2"));
+    try std.testing.expect(!isHttpsUrl("https://user:pass@example.com/v2"));
 }
 
 test "consumeOpenAiSse reads content and stop" {

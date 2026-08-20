@@ -422,7 +422,7 @@ pub fn consumeOpenAiSse(
         if (choice != .object) continue;
 
         if (choice.object.get("finish_reason")) |fr| {
-            if (fr == .string) {
+            if (fr == .string and fr.string.len > 0) {
                 finish_reason = types.ProviderFinishReason.parse_legacy(fr.string) orelse .stop;
             }
         }
@@ -444,7 +444,7 @@ pub fn consumeOpenAiSse(
                 for (tcs.array.items) |tc| {
                     if (tc != .object) continue;
                     if (tc.object.get("id")) |id| {
-                        if (id == .string) {
+                        if (id == .string and id.string.len > 0) {
                             tool_id.clearRetainingCapacity();
                             try tool_id.appendSlice(alloc, id.string);
                         }
@@ -452,13 +452,13 @@ pub fn consumeOpenAiSse(
                     const fn_v = tc.object.get("function") orelse continue;
                     if (fn_v != .object) continue;
                     if (fn_v.object.get("name")) |n| {
-                        if (n == .string) {
+                        if (n == .string and n.string.len > 0) {
                             tool_name.clearRetainingCapacity();
                             try tool_name.appendSlice(alloc, n.string);
                         }
                     }
                     if (fn_v.object.get("arguments")) |a| {
-                        if (a == .string) try tool_args.appendSlice(alloc, a.string);
+                        if (a == .string and a.string.len > 0) try tool_args.appendSlice(alloc, a.string);
                     }
                 }
             }
@@ -629,6 +629,35 @@ test "https origins are recognized" {
     try std.testing.expect(isHttpsUrl("https://example.com/v2"));
     try std.testing.expect(!isHttpsUrl("http://example.com/v2"));
     try std.testing.expect(!isHttpsUrl("https://user:pass@example.com/v2"));
+}
+
+test "consumeOpenAiSse accumulates incremental IOA tool_calls" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"\"}}]},\"finish_reason\":\"\"}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"\",\"arguments\":\"{\"}}]},\"finish_reason\":\"\"}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"\",\"arguments\":\"\\\"path\\\":\\\"/tmp\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[]},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeOpenAiSse(alloc, &reader, undefined, Noop.chunk, &cancel);
+    defer {
+        if (completion.content) |c| alloc.free(c);
+        for (completion.tool_calls) |call| {
+            alloc.free(call.id);
+            alloc.free(call.name);
+            alloc.free(call.arguments_json);
+        }
+        alloc.free(completion.tool_calls);
+    }
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("list_dir", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
 }
 
 test "consumeOpenAiSse reads content and stop" {

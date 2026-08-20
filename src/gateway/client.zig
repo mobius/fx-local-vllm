@@ -1167,7 +1167,7 @@ fn streamGatewayCompletionCoreWithOptions(
     core_options: StreamCoreOptions,
 ) !StreamResult {
     const model = request.model;
-    const openai = openai_compat.protocolEnabled();
+    const openai = openai_compat.shouldUseOpenAiWire(request.chat_url);
     const payload = if (openai)
         try openai_compat.rewriteVercelBodyToOpenAiWithModel(alloc, request.payload, model)
     else

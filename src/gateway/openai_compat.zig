@@ -18,6 +18,14 @@ pub fn protocolEnabled() bool {
         std.ascii.eqlIgnoreCase(raw, "openai-compatible");
 }
 
+pub fn looksLikeOpenAiChatUrl(chat_url: []const u8) bool {
+    return std.mem.indexOf(u8, chat_url, "/chat/completions") != null;
+}
+
+pub fn shouldUseOpenAiWire(chat_url: []const u8) bool {
+    return protocolEnabled() or looksLikeOpenAiChatUrl(chat_url);
+}
+
 pub fn allowPrivateHttp() bool {
     const raw = io_mod.getenv(allow_private_env) orelse return false;
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
@@ -623,6 +631,11 @@ test "derived chat url appends /v1/chat/completions once" {
         "https://example.com/v2/chat/completions",
         derivedChatUrl("https://example.com/v2"),
     );
+}
+
+test "OpenAI wire is used for chat completions URLs" {
+    try std.testing.expect(looksLikeOpenAiChatUrl("https://example.com/v2/chat/completions"));
+    try std.testing.expect(!looksLikeOpenAiChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"));
 }
 
 test "https origins are recognized" {

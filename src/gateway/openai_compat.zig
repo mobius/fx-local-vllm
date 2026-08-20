@@ -8,6 +8,7 @@ const protocol_env = "FX_GATEWAY_PROTOCOL";
 const allow_private_env = "FX_GATEWAY_ALLOW_PRIVATE_HTTP";
 const default_max_tokens: u32 = 8192;
 const qwen38_max_tokens: u32 = 16384;
+const ioa_max_tokens: u32 = 50000;
 
 pub const openai_models_path = "/v1/models";
 
@@ -149,10 +150,11 @@ pub fn rewriteVercelBodyToOpenAiWithModel(
     }
 
     const qwen = if (model_name) |m| isQwenFamily(m) else false;
-    var max_tokens: u32 = if (qwen) qwen38_max_tokens else default_max_tokens;
+    const ioa = if (model_name) |m| isIoaFamily(m) else false;
+    var max_tokens: u32 = if (qwen) qwen38_max_tokens else if (ioa) ioa_max_tokens else default_max_tokens;
     if (envU32("FX_MAX_TOKENS")) |n| {
         max_tokens = n;
-    } else if (!qwen) {
+    } else if (!qwen and !ioa) {
         if (root.get("maxOutputTokens")) |v| {
             if (v == .integer and v.integer > 0) max_tokens = @intCast(@min(v.integer, default_max_tokens));
         } else if (root.get("max_tokens")) |v| {
@@ -165,7 +167,15 @@ pub fn rewriteVercelBodyToOpenAiWithModel(
     try writeComma(&out.writer, &wrote_field);
     try out.writer.writeAll("\"stream\":true");
 
-    if (qwen) {
+    if (ioa) {
+        var effort: []const u8 = ioaDefaultEffort(model_name.?);
+        if (io_mod.getenv("FX_REASONING_EFFORT")) |raw| {
+            if (raw.len > 0) effort = raw;
+        }
+        try writeComma(&out.writer, &wrote_field);
+        try out.writer.writeAll("\"reasoning_effort\":");
+        try std.json.Stringify.value(effort, .{}, &out.writer);
+    } else if (qwen) {
         var effort: []const u8 = "medium";
         if (io_mod.getenv("FX_REASONING_EFFORT")) |raw| {
             if (raw.len > 0) effort = raw;
@@ -181,6 +191,16 @@ pub fn rewriteVercelBodyToOpenAiWithModel(
 
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn isIoaFamily(model: []const u8) bool {
+    return std.mem.indexOf(u8, model, "deepseek-v4-") != null and
+        std.mem.endsWith(u8, model, "-ioa");
+}
+
+fn ioaDefaultEffort(model: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, model, "pro") != null) return "low";
+    return "max";
 }
 
 fn isQwenFamily(model: []const u8) bool {
@@ -511,6 +531,19 @@ test "rewrite applies Qwen3.8 official sampling" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"enable_thinking\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"preserve_thinking\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"medium\"") != null);
+}
+
+test "rewrite applies IOA flash max and pro low" {
+    const alloc = std.testing.allocator;
+    const src = "{\"prompt\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    const flash = try rewriteVercelBodyToOpenAiWithModel(alloc, src, "deepseek-v4-flash-ioa");
+    defer alloc.free(flash);
+    try std.testing.expect(std.mem.indexOf(u8, flash, "\"max_tokens\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flash, "\"reasoning_effort\":\"max\"") != null);
+    const pro = try rewriteVercelBodyToOpenAiWithModel(alloc, src, "deepseek-v4-pro-ioa");
+    defer alloc.free(pro);
+    try std.testing.expect(std.mem.indexOf(u8, pro, "\"max_tokens\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pro, "\"reasoning_effort\":\"low\"") != null);
 }
 
 test "rewrite flattens user content parts" {

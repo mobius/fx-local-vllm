@@ -552,7 +552,7 @@ pub fn consumeOpenAiSse(
 
     for (&accs, 0..) |*acc, i| {
         if (!acc.used or acc.name.items.len == 0) continue;
-        var args = acc.args.items;
+        var args: []const u8 = acc.args.items;
         if (args.len == 0) args = "{}";
         if (try types.ToolArgumentIntegrity.classifySerialized(alloc, args) == .malformed_json) {
             args = "{}";

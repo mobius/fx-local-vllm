@@ -31,6 +31,6 @@ fx still builds a Vercel-style request internally. Before send, `src/gateway/ope
 - Vercel tool objects → `{type:function,function:{parameters}}`
 - `maxOutputTokens` → `max_tokens` (default cap 8192; Qwen3.8 family uses 16384)
 - `stream: true`
-- Qwen / Huihui models also send official Qwen3.8 sampling: `temperature` 1.0, `top_p` 0.95, `presence_penalty` 0.0, `top_k` 20, `chat_template_kwargs.enable_thinking`, `preserve_thinking`, `reasoning_effort` medium (or fx `reasoning` / `FX_REASONING_EFFORT`)
+- Qwen / Huihui thinking mode (default): `max_tokens` 16384 (must be sent; server default is 128 for thinking+content), `temperature` 1.0, `top_p` 0.95, `top_k` 20, `presence_penalty` 0, `enable_thinking`/`preserve_thinking` true, `reasoning_effort` **medium**. Map `high`/`max` to `xhigh`. `off`/`none` turns thinking off and uses `presence_penalty` 1.5.
 
 Responses are parsed as OpenAI SSE (`choices[0].delta.content`, `finish_reason`).

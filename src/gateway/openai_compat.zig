@@ -176,17 +176,28 @@ pub fn rewriteVercelBodyToOpenAiWithModel(
         try out.writer.writeAll("\"reasoning_effort\":");
         try std.json.Stringify.value(effort, .{}, &out.writer);
     } else if (qwen) {
-        var effort: []const u8 = "medium";
-        if (io_mod.getenv("FX_REASONING_EFFORT")) |raw| {
-            if (raw.len > 0) effort = raw;
-        } else if (root.get("reasoning")) |r| {
-            if (r == .string and r.string.len > 0) effort = r.string;
-        }
+        const raw_effort = blk: {
+            if (io_mod.getenv("FX_REASONING_EFFORT")) |raw| {
+                if (raw.len > 0) break :blk raw;
+            }
+            if (root.get("reasoning")) |r| {
+                if (r == .string and r.string.len > 0) break :blk r.string;
+            }
+            break :blk "medium";
+        };
+        const thinking = qwenThinkingEnabled(raw_effort);
+        const effort = mapQwenReasoningEffort(raw_effort);
         try writeComma(&out.writer, &wrote_field);
-        try out.writer.writeAll(
-            \\"temperature":1.0,"top_p":0.95,"presence_penalty":0.0,"top_k":20,"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true},"reasoning_effort":
-        );
-        try std.json.Stringify.value(effort, .{}, &out.writer);
+        if (thinking) {
+            try out.writer.writeAll(
+                \\"temperature":1.0,"top_p":0.95,"presence_penalty":0.0,"top_k":20,"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true},"reasoning_effort":
+            );
+            try std.json.Stringify.value(effort, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll(
+                \\"temperature":1.0,"top_p":0.95,"presence_penalty":1.5,"top_k":20,"chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}
+            );
+        }
     }
 
     try out.writer.writeByte('}');
@@ -201,6 +212,22 @@ fn isIoaFamily(model: []const u8) bool {
 fn ioaDefaultEffort(model: []const u8) []const u8 {
     if (std.mem.indexOf(u8, model, "pro") != null) return "low";
     return "max";
+}
+
+fn qwenThinkingEnabled(raw: []const u8) bool {
+    return !std.ascii.eqlIgnoreCase(raw, "off") and
+        !std.ascii.eqlIgnoreCase(raw, "none") and
+        !std.ascii.eqlIgnoreCase(raw, "false") and
+        !std.ascii.eqlIgnoreCase(raw, "0");
+}
+
+fn mapQwenReasoningEffort(raw: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh") or
+        std.ascii.eqlIgnoreCase(raw, "high") or
+        std.ascii.eqlIgnoreCase(raw, "max"))
+        return "xhigh";
+    return "medium";
 }
 
 fn isQwenFamily(model: []const u8) bool {
@@ -531,6 +558,25 @@ test "rewrite applies Qwen3.8 official sampling" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"enable_thinking\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"preserve_thinking\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"medium\"") != null);
+}
+
+test "Qwen high maps to xhigh and off disables thinking" {
+    const alloc = std.testing.allocator;
+    const high = try rewriteVercelBodyToOpenAiWithModel(
+        alloc,
+        "{\"prompt\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning\":\"high\"}",
+        "Qwen3.8-27B-INT4",
+    );
+    defer alloc.free(high);
+    try std.testing.expect(std.mem.indexOf(u8, high, "\"reasoning_effort\":\"xhigh\"") != null);
+    const off = try rewriteVercelBodyToOpenAiWithModel(
+        alloc,
+        "{\"prompt\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning\":\"off\"}",
+        "Qwen3.8-27B-INT4",
+    );
+    defer alloc.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"enable_thinking\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"presence_penalty\":1.5") != null);
 }
 
 test "rewrite applies IOA flash max and pro low" {

@@ -309,7 +309,10 @@ pub const Reader = struct {
                 &.{destination},
             ) catch return 0;
         }
-        return std.posix.read(std.posix.STDIN_FILENO, destination) catch return 0;
+        return std.Io.File.stdin().readStreaming(
+            io_mod.getIo(),
+            &.{destination},
+        ) catch return 0;
     }
 
     fn readFromSource(self: *Reader) usize {

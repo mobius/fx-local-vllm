@@ -941,7 +941,7 @@ pub const Root = struct {
         };
         defer durable_home.close(zio);
         if (mode == .writable) {
-            durable_home.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setPermissionsCompat(durable_home, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(durable_home, mode);
@@ -973,7 +973,7 @@ pub const Root = struct {
         };
         errdefer sessions_dir.close(zio);
         if (mode == .writable) {
-            sessions_dir.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setPermissionsCompat(sessions_dir, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(sessions_dir, mode);
@@ -1292,7 +1292,9 @@ fn validateLeaf(name: []const u8) !void {
 fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o700) {
+    if (mode == .writable and
+        !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700))
+    {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1300,7 +1302,9 @@ fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
 fn verifyManagedFile(file: std.Io.File, mode: OpenMode) !void {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o600) {
+    if (mode == .writable and
+        !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o600))
+    {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1320,7 +1324,7 @@ fn openSessionDir(
     };
     errdefer dir.close(io_mod.getIo());
     if (mode == .writable) {
-        dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+        io_mod.setPermissionsCompat(dir, private_dir_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateDir(dir, mode);
@@ -1333,16 +1337,33 @@ fn openManagedFile(
     mode: std.Io.Dir.OpenFileOptions.Mode,
 ) !std.Io.File {
     try validateLeaf(name);
+    const initial = dir.dir.statFile(io_mod.getIo(), name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+        else => return err,
+    };
+    if (initial.kind != .file or initial.nlink != 1) return error.SessionPathUnsafe;
     var file = dir.dir.openFile(io_mod.getIo(), name, .{
         .mode = mode,
         .allow_directory = false,
-        .follow_symlinks = false,
+        // Zig 0.16 creates an asynchronous Windows handle for no-follow
+        // opens, while its metadata presents that handle as synchronous.
+        // Session replay reads regular files sequentially, so use a normal
+        // synchronous open on Windows after the no-follow identity check.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows) {
+        const opened = file.stat(io_mod.getIo()) catch return error.SessionPathUnsafe;
+        if (opened.kind != .file or opened.nlink != 1 or opened.inode != initial.inode) {
+            return error.SessionPathUnsafe;
+        }
+    }
     try verifyManagedFile(file, if (mode == .read_only) .read_only else .writable);
     return file;
 }
@@ -2029,7 +2050,6 @@ fn createNativeSession(
         synthesized_usage = try fresh_usage.snapshot(alloc);
     }
     defer if (synthesized_usage) |*usage| usage.deinit(alloc);
-
     const generation = randomIdentifier();
     const event_id = randomIdentifier();
     const authority_id = randomIdentifier();
@@ -4255,7 +4275,7 @@ fn cleanupOrphansImpl(
             continue;
         };
         if (stat.kind != .file or stat.nlink != 1 or
-            stat.permissions.toMode() & 0o777 != 0o600)
+            !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o600))
         {
             report.ignored += 1;
             continue;

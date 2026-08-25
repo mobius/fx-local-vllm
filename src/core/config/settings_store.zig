@@ -361,14 +361,19 @@ pub const Store = struct {
         errdefer durable_home.close(zio);
 
         if (mode == .writable) {
-            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(0o700)) catch {
+            io_mod.setPermissionsCompat(
+                durable_home,
+                std.Io.File.Permissions.fromMode(0o700),
+            ) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const stat = try durable_home.stat(zio);
         if (stat.kind != .directory) return error.DurablePathUnsafe;
         const durable_mode = stat.permissions.toMode() & 0o777;
-        if (mode == .writable and durable_mode != 0o700) {
+        if (mode == .writable and
+            !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700))
+        {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
@@ -728,13 +733,18 @@ pub const Store = struct {
         const stat = try file.stat(zio);
         try io_mod.verifyOpenedRegularFile(stat, open_mode);
         if (self.mode == .writable) {
-            file.setPermissions(zio, std.Io.File.Permissions.fromMode(0o600)) catch {
+            io_mod.setPermissionsCompat(
+                file,
+                std.Io.File.Permissions.fromMode(0o600),
+            ) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const verified_stat = if (self.mode == .writable) try file.stat(zio) else stat;
         const primary_mode = verified_stat.permissions.toMode() & 0o777;
-        if (self.mode == .writable and primary_mode != 0o600) {
+        if (self.mode == .writable and
+            !io_mod.permissionsMatchPrivateMode(verified_stat.permissions, 0o600))
+        {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (self.mode == .read_only and durableModeWritableByGroupOrOther(primary_mode)) {

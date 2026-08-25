@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("session_codec.zig");
 const session_log = @import("session_log.zig");
@@ -335,13 +336,22 @@ pub fn readLatestSnapshotToken(
     defer latest.close(io_mod.getIo());
 
     var name: [69]u8 = undefined;
+    const pointer_name = latestPointerFilename(workspace_root, &name);
+    const initial = latest.statFile(io_mod.getIo(), pointer_name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.NotDir, error.SymLinkLoop, error.IsDir => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    if (initial.kind != .file or initial.nlink != 1) return error.InvalidSessionIndex;
     var file = latest.openFile(
         io_mod.getIo(),
-        latestPointerFilename(workspace_root, &name),
+        pointer_name,
         .{
             .mode = .read_only,
             .allow_directory = false,
-            .follow_symlinks = false,
+            .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
             .resolve_beneath = true,
         },
     ) catch |err| switch (err) {
@@ -355,6 +365,9 @@ pub fn readLatestSnapshotToken(
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) {
         return error.InvalidSessionIndex;
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (stat.inode != initial.inode) return error.InvalidSessionIndex;
     }
     return .{ .file = .{
         .inode = @intCast(stat.inode),
@@ -529,10 +542,19 @@ fn readLatestPointerJsonFromSessions(
     defer latest.close(io_mod.getIo());
 
     var name: [69]u8 = undefined;
-    var file = latest.openFile(io_mod.getIo(), latestPointerFilename(workspace_root, &name), .{
+    const pointer_name = latestPointerFilename(workspace_root, &name);
+    const initial = latest.statFile(io_mod.getIo(), pointer_name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.NotDir, error.SymLinkLoop, error.IsDir => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    if (initial.kind != .file or initial.nlink != 1) return error.InvalidSessionIndex;
+    var file = latest.openFile(io_mod.getIo(), pointer_name, .{
         .mode = .read_only,
         .allow_directory = false,
-        .follow_symlinks = false,
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -542,6 +564,9 @@ fn readLatestPointerJsonFromSessions(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.InvalidSessionIndex;
+    if (comptime builtin.os.tag == .windows) {
+        if (stat.inode != initial.inode) return error.InvalidSessionIndex;
+    }
     const bytes = io_mod.readFileToEnd(alloc, &file, max_latest_pointer_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidSessionIndex,

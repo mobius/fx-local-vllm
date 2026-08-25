@@ -43,6 +43,7 @@ pub fn executeVercel(
 }
 
 fn setVercelHttpTimeout(conn: *std.http.Client.Connection) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
     const sock = conn.stream_writer.stream.socket.handle;
     const timeout = std.posix.timeval{ .sec = vercel_http_timeout_sec, .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {

@@ -4,6 +4,7 @@
 //! ignored so the integration cannot block or terminate an fx session.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
@@ -130,7 +131,7 @@ pub const Client = struct {
     }
 
     fn sendAll(self: *Client, requests: []const Request) void {
-        if (comptime host_target.is_wasm) return;
+        if (comptime host_target.is_wasm or builtin.os.tag == .windows) return;
         if (!self.enabled) return;
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -181,6 +182,7 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
+    if (comptime builtin.os.tag == .windows) return;
     std.posix.setsockopt(
         stream.socket.handle,
         std.posix.SOL.SOCKET,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const monitor_core = @import("monitor.zig");
 const operation = @import("operation.zig");
@@ -15,6 +16,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
+const PidType = if (builtin.os.tag == .windows) u32 else std.posix.pid_t;
 
 pub const per_session_payload_limit: u64 = 64 * 1024 * 1024;
 pub const profile_payload_limit: u64 = 512 * 1024 * 1024;
@@ -460,7 +462,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+            _ = std.fmt.parseInt(PidType, pid, 10) catch
                 return error.InvalidTerminalRecord;
             _ = process_supervisor.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
@@ -7223,7 +7225,7 @@ fn test_process_owner(
     process_provider: background_process_provider.Provider,
 ) !contracts.ProcessOwner {
     var pid_buffer: [32]u8 = undefined;
-    const pid = std.c.getpid();
+    const pid = io_mod.currentProcessId();
     const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
     const token = try process_provider.captureToken(
         alloc,

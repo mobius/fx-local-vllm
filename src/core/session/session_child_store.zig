@@ -379,7 +379,7 @@ const CapabilityImpl = struct {
         errdefer dir.close(io_mod.getIo());
 
         if (self.mode == .writable) {
-            dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+            io_mod.setPermissionsCompat(dir, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDirectory(dir);
@@ -535,7 +535,7 @@ pub const SessionChildCapability = struct {
         };
         errdefer route.close(io_mod.getIo());
         if (mode == .writable) {
-            route.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+            io_mod.setPermissionsCompat(route, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDirectory(route);
@@ -592,8 +592,8 @@ pub const SessionChildCapability = struct {
         };
         errdefer records.close(io_mod.getIo());
         if (mode == .writable) {
-            records.setPermissions(
-                io_mod.getIo(),
+            io_mod.setPermissionsCompat(
+                records,
                 private_dir_permissions,
             ) catch return error.PrivateStatePermissionsUnsupported;
         }
@@ -626,8 +626,8 @@ pub const SessionChildCapability = struct {
         errdefer if (logs) |route| route.close(io_mod.getIo());
         if (logs) |route| {
             if (mode == .writable) {
-                route.setPermissions(
-                    io_mod.getIo(),
+                io_mod.setPermissionsCompat(
+                    route,
                     private_dir_permissions,
                 ) catch return error.PrivateStatePermissionsUnsupported;
             }
@@ -826,7 +826,7 @@ pub const SessionChildCapability = struct {
         };
         var file_open = true;
         errdefer if (file_open) file.close(io_mod.getIo());
-        file.setPermissions(io_mod.getIo(), private_file_permissions) catch
+        io_mod.setPermissionsCompat(file, private_file_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
         try verifyPrivateRegularFile(file);
         io_mod.syncVerifiedDir(route_dir.dir) catch {
@@ -1162,7 +1162,7 @@ fn validateName(name: []const u8) !void {
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1177,7 +1177,7 @@ fn verifyPrivateOpenedStat(
 ) !void {
     io_mod.verifyOpenedRegularFile(stat, mode) catch
         return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (!io_mod.permissionsMatchPrivateMode(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1186,7 +1186,7 @@ fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
     if (stat.kind != .file or stat.nlink != 1) {
         return error.SessionPathUnsafe;
     }
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (!io_mod.permissionsMatchPrivateMode(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1207,7 +1207,7 @@ fn openPrivateFile(
     };
     errdefer file.close(io_mod.getIo());
     if (capability_mode == .writable and mode != .read_only) {
-        file.setPermissions(io_mod.getIo(), private_file_permissions) catch
+        io_mod.setPermissionsCompat(file, private_file_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateOpenedStat(try file.stat(io_mod.getIo()), mode);

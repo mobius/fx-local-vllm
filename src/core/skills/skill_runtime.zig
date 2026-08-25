@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -503,7 +504,10 @@ fn appendSkillCandidate(
 
     var file = candidate_dir.openFile(io_mod.getIo(), "SKILL.md", .{
         .allow_directory = false,
-        .follow_symlinks = false,
+        // Zig 0.16 exposes a Windows no-follow handle as asynchronous. The
+        // initial no-follow stat plus inode check below preserves identity
+        // while allowing the synchronous sequential reader to consume it.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
     }) catch |err| {
         if (err == error.FileNotFound) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -511,6 +515,21 @@ fn appendSkillCandidate(
         return;
     };
     defer file.close(io_mod.getIo());
+
+    const opened_stat = file.stat(io_mod.getIo()) catch {
+        if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
+        return;
+    };
+    if (opened_stat.kind != .file) {
+        if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
+        return;
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (opened_stat.inode != path_stat.inode) {
+            if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
+            return;
+        }
+    }
 
     const inspection = try inspectSkillCandidateFile(alloc, &file, entry_name);
     const candidate = switch (inspection) {

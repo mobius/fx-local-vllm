@@ -59,12 +59,17 @@ pub fn build(b: *std.Build) void {
             .stack_check = false,
             .stack_protector = false,
             .omit_frame_pointer = true,
-            .unwind_tables = .none,
-            .error_tracing = false,
+            .unwind_tables = if (optimize == .Debug) .async else .none,
+            .error_tracing = optimize == .Debug,
             .strip = optimize != .Debug,
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    if (target.result.os.tag == .windows) {
+        // The Windows implementation of the socket polling path uses the
+        // Winsock C ABI for the few calls not covered by std.Io yet.
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+    }
 
     b.installArtifact(exe);
 

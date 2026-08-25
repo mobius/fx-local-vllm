@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const helpers = @import("upgrade_helpers.zig");
@@ -177,6 +178,10 @@ fn upgradeWorkerInner(
     progress: *ProgressState,
     show_progress: bool,
 ) !void {
+    if (comptime builtin.os.tag == .windows) {
+        result.err = .fetch_failed;
+        return;
+    }
     const cdn_base = helpers.resolveCdnBase();
     const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base) catch {
         result.err = .fetch_failed;

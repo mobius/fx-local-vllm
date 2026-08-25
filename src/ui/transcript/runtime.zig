@@ -4080,7 +4080,10 @@ fn sameFullDiffResolver(
 }
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    // Windows console handles are runtime values (the PEB is not comptime
+    // evaluable), so initialize stdout in the runtime constructor instead of
+    // as a struct field default.
+    stdout_file: std.Io.File = undefined,
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
     layout: Layout = undefined,

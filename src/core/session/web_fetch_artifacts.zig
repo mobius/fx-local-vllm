@@ -251,10 +251,15 @@ fn ensureManagedDir(parent_path: []const u8, child_name: []const u8) !void {
             else => return err,
         };
         defer child.close(zio);
-        child.setPermissions(zio, std.Io.File.Permissions.fromMode(0o700)) catch
+        io_mod.setPermissionsCompat(
+            child,
+            std.Io.File.Permissions.fromMode(0o700),
+        ) catch
             return error.CorruptArtifactStore;
         const stat = try child.stat(zio);
-        if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
+        if (stat.kind != .directory or
+            !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700))
+        {
             return error.CorruptArtifactStore;
         }
         return;

@@ -381,7 +381,7 @@ fn refreshForegroundTargetTree(
 ) !void {
     try descendants.refresh(target_pid);
     if (comptime builtin.os.tag == .linux) {
-        try descendants.refreshAdditionalRoot(std.c.getpid());
+        try descendants.refreshAdditionalRoot(io_mod.currentProcessId());
     }
     if (comptime builtin.os.tag == .macos) {
         if (foregroundSessionTerminationRequested()) {
@@ -398,7 +398,7 @@ fn beginForegroundTargetTermination(
     termination_started_ms.* = now_ms;
     const count = descendants.signalOutsideProcessGroup(
         std.posix.SIG.TERM,
-        std.c.getpid(),
+        io_mod.currentProcessId(),
     );
     debug_trace.logf(
         "core",
@@ -1940,7 +1940,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
-    return @intCast(std.c.getpid());
+    return io_mod.currentProcessId();
 }
 
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
@@ -2706,6 +2706,9 @@ fn signalChild(
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.Unsupported;
+    }
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,

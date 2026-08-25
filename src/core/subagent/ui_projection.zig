@@ -754,6 +754,7 @@ fn loadPageWithTreeLimit(
         .snapshot => |snapshot| if (snapshot.restart_required) {
             tree_result.deinit(alloc);
             restarted = true;
+            std.debug.print("fx ui_projection anchored retry anchor={any}\\n", .{anchor_id != null});
             tree_result = try source.manager.snapshot(alloc, .{
                 .root_id = source.root_id,
                 .anchor_id = anchor_id,
@@ -764,6 +765,7 @@ fn loadPageWithTreeLimit(
 
     const tree = switch (tree_result) {
         .failure => |failure| {
+            std.debug.print("fx ui_projection retry failure={s}\\n", .{@tagName(failure.code)});
             tree_result.deinit(alloc);
             return .{ .degraded = failure.code };
         },

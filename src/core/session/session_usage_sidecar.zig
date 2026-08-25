@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_usage = @import("session_usage.zig");
@@ -106,7 +107,9 @@ pub fn capture(
     var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
         .mode = .read_only,
         .allow_directory = false,
-        .follow_symlinks = false,
+        // Retain the no-follow stat above, but avoid Zig 0.16's unreadable
+        // Windows no-follow handle for the streaming read below.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -120,6 +123,9 @@ pub fn capture(
         verified.permissions.toMode() & 0o777 != 0o600)
     {
         return .{ .invalid = "unsafe_verified_shape" };
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (verified.inode != initial.inode) return .{ .invalid = "changed_during_open" };
     }
     if (verified.size != initial.size) return .{ .invalid = "changed_during_open" };
     const bytes = io_mod.readFileToEnd(

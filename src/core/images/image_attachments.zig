@@ -598,6 +598,9 @@ const SnapshotMetadata = struct {
 };
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
+    if (comptime builtin.os.tag == .windows) {
+        return;
+    }
     io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
         error.OperationUnsupported => {},
         else => return err,

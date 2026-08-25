@@ -175,7 +175,7 @@ pub const Tracker = struct {
         while (changed) {
             changed = false;
             for (self.macos_pid_buffer[0..process_count]) |pid| {
-                if (pid <= 0 or pid == std.c.getpid()) continue;
+                if (pid <= 0 or pid == io_mod.currentProcessId()) continue;
                 if (try self.trackLineageProcess(pid)) changed = true;
             }
         }

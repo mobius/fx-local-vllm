@@ -2430,7 +2430,7 @@ test "tmux peer deadline bounds accept receive partial frames and cancellation" 
     const socket_path = try std.fmt.allocPrint(
         alloc,
         "/tmp/fx-peer-deadline-{d}.sock",
-        .{std.c.getpid()},
+        .{io_mod.currentProcessId()},
     );
     defer alloc.free(socket_path);
     std.Io.Dir.deleteFileAbsolute(std.testing.io, socket_path) catch {};

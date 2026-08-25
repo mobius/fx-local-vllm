@@ -510,17 +510,31 @@ pub fn openSessionFile(
     name: []const u8,
     mode: session_log.OpenMode,
 ) !std.Io.File {
+    const initial = session_dir.dir.statFile(io_mod.getIo(), name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
+        else => return err,
+    };
+    if (initial.kind != .file or initial.nlink != 1) return error.SessionPathUnsafe;
+
     const file = session_dir.dir.openFile(io_mod.getIo(), name, .{
         .mode = if (mode == .writable) .read_write else .read_only,
         .allow_directory = false,
-        .follow_symlinks = false,
+        // See io.openExistingRegularFile: the no-follow Windows handle in
+        // Zig 0.16 is not reliably readable through the streaming interface.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
-    try verifyOpenedSessionFile(try file.stat(io_mod.getIo()), mode);
+    const opened = try file.stat(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows) {
+        if (opened.inode != initial.inode) return error.SessionPathUnsafe;
+    }
+    try verifyOpenedSessionFile(opened, mode);
     return file;
 }
 

@@ -198,7 +198,7 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
-        if (!isSupported()) return error.TerminalHostUnsupported;
+        if (comptime !isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,
@@ -457,7 +457,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     debug_trace.logf(
         "terminal_host",
         "host listening pid={d} protocol={d}-{d}",
-        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
+        .{ io_mod.currentProcessId(), config.hello.range.minimum, config.hello.range.current },
     );
 
     while (!state.stopping.load(.acquire)) {
@@ -614,6 +614,7 @@ fn idleOwner(state: *HostState) void {
 }
 
 fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
+    if (comptime builtin.os.tag == .windows) return error.TerminalHostUnsupported;
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = handle,
         .events = std.posix.POLL.IN,
@@ -1160,7 +1161,7 @@ fn testCorrelationFromEnvironment(name: []const u8) ?u64 {
 }
 
 fn applySocketTimeout(stream: std.Io.net.Stream) void {
-    if (comptime !isSupported()) return;
+    if (comptime !isSupported() or builtin.os.tag == .windows) return;
     const timeout = std.posix.timeval{ .sec = 5, .usec = 0 };
     std.posix.setsockopt(
         stream.socket.handle,
@@ -1261,7 +1262,7 @@ fn writeIdentity(
     instance: []const u8,
 ) !void {
     var pid_buffer: [32]u8 = undefined;
-    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{io_mod.currentProcessId()});
     const process_token = try process_provider.captureToken(
         alloc,
         pid,

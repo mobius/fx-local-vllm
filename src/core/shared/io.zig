@@ -29,6 +29,29 @@ pub fn getIo() std.Io {
     return process_io_for(builtin.os.tag, fallback_threaded.io());
 }
 
+/// Returns a numeric process identifier on every native target. Zig 0.16
+/// models Windows `std.c.pid_t` as a handle pointer, which is not suitable for
+/// formatting, persistence, or PID comparisons.
+pub fn currentProcessId() u32 {
+    if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
+}
+
+/// Converts `std.process.Child.id` into a stable numeric process identifier.
+/// Zig represents a Windows child id as an owning process handle, while the
+/// rest of fx persists the identifier as decimal text.
+pub fn childProcessId(id: std.process.Child.Id) u32 {
+    if (comptime builtin.os.tag == .windows) {
+        const Kernel32 = struct {
+            extern "kernel32" fn GetProcessId(
+                process: std.os.windows.HANDLE,
+            ) callconv(.winapi) std.os.windows.DWORD;
+        };
+        return Kernel32.GetProcessId(id);
+    }
+    return @intCast(id);
+}
+
 /// Opens an absolute directory path without following any path component.
 /// The caller owns the returned directory handle.
 pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
@@ -172,10 +195,17 @@ pub fn openExistingRegularFile(
         var file = try dir.openFile(getIo(), sub_path, .{
             .mode = mode,
             .allow_directory = false,
-            .follow_symlinks = false,
+            // Zig 0.16's Windows no-follow open path can produce an
+            // asynchronous handle that fails ordinary streaming reads. The
+            // initial no-follow stat plus post-open identity check preserves
+            // the security boundary while allowing a synchronous file handle.
+            .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         });
         errdefer file.close(getIo());
         const stat = try file.stat(getIo());
+        if (comptime builtin.os.tag == .windows) {
+            if (stat.inode != initial.inode) return error.DurablePathUnsafe;
+        }
         try verifyOpenedRegularFile(stat, mode);
         return file;
     }
@@ -352,7 +382,10 @@ fn getenvFromLibc(key: []const u8) ?[]const u8 {
 pub fn readFileToEnd(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: usize) ![]u8 {
     const zio = getIo();
     var read_buf: [8192]u8 = undefined;
-    var r = file.reader(zio, &read_buf);
+    // Zig 0.16's default positional reader can enter the Windows cancellation
+    // state machine for handles opened with no-follow semantics. These are
+    // bounded whole-file reads, so use the sequential path explicitly.
+    var r = file.readerStreaming(zio, &read_buf);
     return r.interface.allocRemaining(alloc, std.Io.Limit.limited(max_bytes));
 }
 
@@ -400,6 +433,40 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
 
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+
+/// Zig 0.16 has no Windows implementation for directory permission updates.
+/// File permission updates are implemented by the standard library, but the
+/// directory vtable slot still panics. On Windows the durable-state boundary
+/// therefore relies on the profile directory's native ACLs and skips the
+/// POSIX-mode mutation; file handles still use the standard-library operation.
+pub fn setPermissionsCompat(target: anytype, permissions: std.Io.File.Permissions) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (@TypeOf(target) == std.Io.File) {
+            return target.setPermissions(getIo(), permissions);
+        }
+        return;
+    }
+    return target.setPermissions(getIo(), permissions);
+}
+
+/// Returns whether a file can be treated as writable by the caller. Windows
+/// ACLs are not exposed by `std.Io.File.Stat` in Zig 0.16, so the Windows
+/// branch is a best-effort attribute check; the subsequent writable open is
+/// still authoritative for actual writes.
+pub fn permissionsAllowWrite(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return !permissions.readOnly();
+    return permissions.toMode() & 0o222 != 0;
+}
+
+/// POSIX private modes are not representable in the Zig 0.16 Windows stat
+/// result. Windows state is protected by the user's profile ACL instead.
+pub fn permissionsMatchPrivateMode(
+    permissions: std.Io.File.Permissions,
+    expected_mode: u32,
+) bool {
+    if (comptime builtin.os.tag == .windows) return true;
+    return permissions.toMode() & 0o777 == expected_mode;
+}
 
 pub const VerifiedDir = struct {
     dir: std.Io.Dir,
@@ -463,19 +530,29 @@ fn validateRelativeLeaf(name: []const u8) !void {
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsMatchPrivateMode(stat.permissions, 0o600)) {
+        return error.PrivateStatePermissionsUnsupported;
+    }
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsMatchPrivateMode(stat.permissions, 0o700)) {
+        return error.PrivateStatePermissionsUnsupported;
+    }
 }
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+    if (comptime builtin.os.tag == .windows) {
+        // Windows does not expose a portable directory fsync through Zig 0.16
+        // (and the std.Io vtable has no directory flush implementation). File
+        // contents are still flushed through File.sync; treat the directory
+        // metadata barrier as best-effort instead of disabling persistence.
+        return;
+    }
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -516,7 +593,8 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     };
     errdefer dir.close(zio);
 
-    dir.setPermissions(zio, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
+    setPermissionsCompat(dir, private_dir_permissions) catch
+        return error.PrivateStatePermissionsUnsupported;
     try verifyPrivateDirectory(dir);
     if (created) try syncVerifiedDir(parent);
     return .{ .dir = dir };
@@ -537,7 +615,7 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+    if (!permissionsAllowWrite(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
@@ -586,9 +664,12 @@ pub fn durableReplaceVerifiedWithOps(
         .resolve_beneath = true,
     }) catch return error.DurableReplacePreRenameFailed;
     temp_exists = true;
-    defer file.close(getIo());
+    defer {
+        file.close(getIo());
+    }
 
-    file.setPermissions(getIo(), private_file_permissions) catch return error.PrivateStatePermissionsUnsupported;
+    setPermissionsCompat(file, private_file_permissions) catch
+        return error.PrivateStatePermissionsUnsupported;
     verifyPrivateRegularFile(file) catch |err| switch (err) {
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => return err,
         else => return error.DurableReplacePreRenameFailed,
@@ -602,7 +683,7 @@ pub fn durableReplaceVerifiedWithOps(
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file or final_stat.nlink != 1 or
-        final_stat.permissions.toMode() & 0o777 != 0o600)
+        !permissionsMatchPrivateMode(final_stat.permissions, 0o600))
     {
         return error.DurableReplacePostRenameFailed;
     }
@@ -635,7 +716,7 @@ fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File
                 }),
                 else => return create_err,
             };
-            created.setPermissions(zio, private_file_permissions) catch {
+            setPermissionsCompat(created, private_file_permissions) catch {
                 created.close(zio);
                 return error.PrivateStatePermissionsUnsupported;
             };
@@ -792,6 +873,14 @@ pub fn makeDirRecursive(path: []const u8) !void {
 }
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        var result_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved_len = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.realPathFileAbsolute(getIo(), path, &result_buf)
+        else
+            try std.Io.Dir.cwd().realPathFile(getIo(), path, &result_buf);
+        return alloc.dupe(u8, result_buf[0..resolved_len]);
+    }
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -825,6 +914,13 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
     } else if (comptime builtin.os.tag == .wasi) {
         if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
         return std.fs.path.resolve(alloc, &.{sub_path});
+    } else if (comptime builtin.os.tag == .windows) {
+        var result_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved_len = if (sub_path.len == 0)
+            try dir.realPath(getIo(), &result_buf)
+        else
+            try dir.realPathFile(getIo(), sub_path, &result_buf);
+        return alloc.dupe(u8, result_buf[0..resolved_len]);
     } else {
         @compileError("dirRealpathAlloc not implemented for this OS");
     }

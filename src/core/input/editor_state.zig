@@ -234,7 +234,16 @@ pub fn deleteRange(
     const clamped_end = @min(@max(end, clamped_start), buffer.items.len);
     if (clamped_start == clamped_end) return false;
     const count = clamped_end - clamped_start;
-    std.mem.copyForwards(u8, buffer.items[clamped_start..], buffer.items[clamped_end..]);
+    // Zig 0.16 requires the source and destination slices passed to
+    // `copyForwards` to have identical lengths. The previous destination
+    // included the deleted tail, which traps with `unreachable` on Windows
+    // before the headless agent request can start.
+    const retained_len = buffer.items.len - clamped_end;
+    std.mem.copyForwards(
+        u8,
+        buffer.items[clamped_start .. clamped_start + retained_len],
+        buffer.items[clamped_end..],
+    );
     buffer.items.len -= count;
     if (cursor.* >= clamped_end) {
         cursor.* -= count;

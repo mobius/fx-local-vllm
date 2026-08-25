@@ -6390,7 +6390,7 @@ test "run_command reactive sandbox retry timeout retains both attempts" {
     const fixture_root = try std.fmt.allocPrint(
         alloc,
         "/var/tmp/fx-sandbox-retry-{d}-{d}",
-        .{ std.c.getpid(), io_mod.nanoTimestamp() },
+        .{ io_mod.currentProcessId(), io_mod.nanoTimestamp() },
     );
     defer alloc.free(fixture_root);
     try std.Io.Dir.cwd().createDirPath(zio, fixture_root);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
@@ -232,10 +233,20 @@ pub fn readSidecarOrFallback(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
 ) !DisplayMetadata {
+    const initial = session_dir.dir.statFile(io_mod.getIo(), sidecar_file, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return missingFallback(alloc),
+        error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),
+        else => return err,
+    };
+    if (initial.kind != .file or initial.nlink != 1) return missingFallback(alloc);
     var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
         .mode = .read_only,
         .allow_directory = false,
-        .follow_symlinks = false,
+        // Keep the no-follow stat above, but use a synchronous Windows handle
+        // for the subsequent streaming read.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound => return missingFallback(alloc),
@@ -243,6 +254,13 @@ pub fn readSidecarOrFallback(
         else => return err,
     };
     defer file.close(io_mod.getIo());
+    const opened = file.stat(io_mod.getIo()) catch |err| return err;
+    if (opened.kind != .file or opened.nlink != 1) {
+        return missingFallback(alloc);
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (opened.inode != initial.inode) return missingFallback(alloc);
+    }
     const bytes = io_mod.readFileToEnd(alloc, &file, max_sidecar_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {

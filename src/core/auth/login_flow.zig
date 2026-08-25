@@ -741,7 +741,7 @@ const LoginPollDeps = struct {
         std.Io.Clock.Timestamp,
     ) anyerror!oauth.PollResult = realPollDeviceToken,
     sleep_ms: *const fn (?*anyopaque, u64) void = realSleepMs,
-    wait_for_enter: *const fn (?*anyopaque, u64) bool = if (host_target.is_wasm)
+    wait_for_enter: *const fn (?*anyopaque, u64) bool = if (host_target.is_wasm or builtin.os.tag == .windows)
         unavailableWaitForEnter
     else
         realWaitForEnter,
@@ -957,6 +957,7 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     var fds = [_]std.posix.pollfd{.{
         .fd = std.posix.STDIN_FILENO,
         .events = std.posix.POLL.IN,
@@ -970,6 +971,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 }
 
 fn discardStdinLine() void {
+    if (comptime builtin.os.tag == .windows) return;
     var buf: [256]u8 = undefined;
     while (true) {
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
@@ -1139,6 +1141,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 }
 
 fn canUseInteractiveTeamPicker() bool {
+    if (comptime builtin.os.tag == .windows) return false;
     const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
     return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
@@ -1174,6 +1177,7 @@ const TeamPickerKey = union(enum) {
 };
 
 fn readTeamPickerKey() !TeamPickerKey {
+    if (comptime builtin.os.tag == .windows) return error.NotATerminal;
     var buf: [8]u8 = undefined;
     const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
     if (first_read == 0) return .ignored;
@@ -1232,6 +1236,7 @@ const TeamPickerRawMode = struct {
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
+        if (comptime builtin.os.tag == .windows) return error.NotATerminal;
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -1268,6 +1273,10 @@ const TeamPickerRawMode = struct {
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
+        if (comptime builtin.os.tag == .windows) {
+            self.active = false;
+            return;
+        }
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }

@@ -373,12 +373,24 @@ fn writeLine(line: []const u8) void {
 
 fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
     var file = std.Io.Dir.createFileAbsolute(zio, path, .{
+        .read = true,
         .truncate = false,
         .lock = .exclusive,
     }) catch return;
     defer file.close(zio);
-    _ = std.c.lseek(file.handle, 0, std.posix.SEEK.END);
-    file.writeStreamingAll(zio, line) catch {};
+    // Do not use the libc lseek shim here. On Windows it can leave the
+    // threaded Io handle at an unexpected offset, causing trace records to
+    // overwrite one another. Query the size and seek through the same Io
+    // interface used for the sequential write.
+    const stat = file.stat(zio) catch return;
+    var write_buffer: [4096]u8 = undefined;
+    // The positional writer only tracks the offset in its own state; this
+    // avoids a Windows file-position syscall while still issuing a single
+    // bounded write at the stat'ed EOF.
+    var writer = file.writer(zio, &write_buffer);
+    writer.seekTo(stat.size) catch return;
+    writer.interface.writeAll(line) catch return;
+    writer.interface.flush() catch {};
 }
 
 fn loadOptionsFromEnv(alloc: Allocator, workspace_root: []const u8) !Options {

@@ -5323,7 +5323,7 @@ fn sendRequestedSigints(state: *CrossThreadSigintState) void {
             std.Thread.yield() catch std.atomic.spinLoopHint();
             continue;
         }
-        std.posix.kill(std.c.getpid(), std.posix.SIG.INT) catch {
+        std.posix.kill(io_mod.currentProcessId(), std.posix.SIG.INT) catch {
             state.failed.store(true, .seq_cst);
         };
         state.sent.store(true, .seq_cst);

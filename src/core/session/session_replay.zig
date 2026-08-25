@@ -35,13 +35,24 @@ pub fn readLineAt(
     errdefer line.deinit(alloc);
     var cursor = offset;
     var chunk: [8192]u8 = undefined;
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
+    // Zig 0.16's Windows positional reader and file seek path can enter the
+    // cancellation state machine for ordinary synchronous handles. Replay is
+    // correctness-first and event logs are bounded, so stay on the streaming
+    // path and discard bytes until the requested logical offset.
+    var remaining = offset;
+    while (remaining > 0) {
+        const discarded = reader.interface.discard(.limited64(remaining)) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (discarded == 0) return null;
+        remaining -= discarded;
+    }
     while (cursor < max_end) {
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
-            chunk[0..@intCast(limit)],
-            cursor,
-        );
+        const count = try reader.interface.readSliceShort(chunk[0..@intCast(limit)]);
         if (count == 0) {
             if (line.items.len == 0) return null;
             return error.TruncatedEventFrame;

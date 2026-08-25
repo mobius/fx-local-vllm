@@ -393,7 +393,7 @@ fn openUsageRecoveryProfileRoot(
     errdefer profile.close(zio);
     const stat = try profile.stat(zio);
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -416,7 +416,7 @@ fn openUsageRecoveryDir(
     errdefer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -427,10 +427,26 @@ fn validateUsageRecoveryMarker(
     recovery: *const io_mod.VerifiedDir,
     session_id: []const u8,
 ) !?i64 {
+    const initial = recovery.dir.statFile(io_mod.getIo(), session_id, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.UsageRecoveryMarkerNotFound,
+        else => return error.InvalidUsageRecoveryIndex,
+    };
+    if (initial.kind != .file or initial.nlink != 1 or
+        initial.size == 0 or
+        initial.size > max_usage_recovery_marker_bytes or
+        !io_mod.permissionsMatchPrivateMode(initial.permissions, 0o600))
+    {
+        return error.InvalidUsageRecoveryIndex;
+    }
     var marker = recovery.dir.openFile(io_mod.getIo(), session_id, .{
         .mode = .read_only,
         .allow_directory = false,
-        .follow_symlinks = false,
+        // The no-follow stat above protects the final path component. On
+        // Windows, Zig 0.16's no-follow handle is not safe for positional or
+        // streaming reads, so open a synchronous handle and verify identity.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound => return error.UsageRecoveryMarkerNotFound,
@@ -442,17 +458,19 @@ fn validateUsageRecoveryMarker(
         stat.nlink != 1 or
         stat.size == 0 or
         stat.size > max_usage_recovery_marker_bytes or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.permissionsMatchPrivateMode(stat.permissions, 0o600))
     {
         return error.InvalidUsageRecoveryIndex;
     }
+    if (comptime builtin.os.tag == .windows) {
+        if (stat.inode != initial.inode) return error.InvalidUsageRecoveryIndex;
+    }
     var bytes: [max_usage_recovery_marker_bytes]u8 = undefined;
     const marker_len: usize = @intCast(stat.size);
-    const read = marker.readPositionalAll(
-        io_mod.getIo(),
-        bytes[0..marker_len],
-        0,
-    ) catch return error.InvalidUsageRecoveryIndex;
+    var read_buffer: [8192]u8 = undefined;
+    var reader = marker.readerStreaming(io_mod.getIo(), &read_buffer);
+    const read = reader.interface.readSliceShort(bytes[0..marker_len]) catch
+        return error.InvalidUsageRecoveryIndex;
     if (read != marker_len) {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -4519,11 +4537,11 @@ fn loadedWriterBelongsToRoot(
 
 fn prepareWritableSessionDir(dir: std.Io.Dir) !void {
     const permissions = std.Io.File.Permissions.fromMode(0o700);
-    dir.setPermissions(io_mod.getIo(), permissions) catch
+    io_mod.setPermissionsCompat(dir, permissions) catch
         return error.PrivateStatePermissionsUnsupported;
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }

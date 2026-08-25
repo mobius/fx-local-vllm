@@ -238,13 +238,13 @@ pub const Store = struct {
             };
         }
 
-        self.durable_home.?.dir.setPermissions(
-            io_mod.getIo(),
+        io_mod.setPermissionsCompat(
+            self.durable_home.?.dir,
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
         const stat = try self.durable_home.?.dir.stat(io_mod.getIo());
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        if (stat.permissions.toMode() & 0o777 != 0o700) {
+        if (!io_mod.permissionsMatchPrivateMode(stat.permissions, 0o700)) {
             return error.PrivateStatePermissionsUnsupported;
         }
     }
@@ -295,12 +295,12 @@ pub const Store = struct {
         const initial = try file.stat(zio);
         if (initial.kind != .file or initial.nlink != 1) return error.DurablePathUnsafe;
         if (writable) {
-            file.setPermissions(zio, private_file_permissions) catch {
+            io_mod.setPermissionsCompat(file, private_file_permissions) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const verified = if (writable) try file.stat(zio) else initial;
-        if (verified.permissions.toMode() & 0o777 != 0o600) {
+        if (!io_mod.permissionsMatchPrivateMode(verified.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (created) {

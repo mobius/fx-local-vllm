@@ -3326,14 +3326,25 @@ fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u
 }
 
 fn formatToolResultEvidenceLine(arena: Allocator, result: core_types.PersistedToolResult) ![]const u8 {
+    // Keep the headless request path diagnosable when a legacy/corrupt session
+    // contains an enum discriminant that this binary no longer recognizes.
+    // `@tagName` assumes a valid enum value and traps with `unreachable` on
+    // Windows before the gateway request is even attempted.
+    var raw_status: u8 = undefined;
+    @memcpy(std.mem.asBytes(&raw_status), std.mem.asBytes(&result.status));
+    const status = switch (raw_status) {
+        0 => "success",
+        1 => "failure",
+        else => "unknown",
+    };
     if (result.output_handle) |handle| {
         if (result.preview) |preview| {
             const compact_preview = try compactLineText(arena, preview, 96);
-            return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s}, preview={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle, compact_preview });
+            return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s}, preview={s})", .{ result.tool_name, status, result.stored_output_bytes, handle, compact_preview });
         }
-        return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle });
+        return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, status, result.stored_output_bytes, handle });
     }
-    return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes)", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes });
+    return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes)", .{ result.tool_name, status, result.stored_output_bytes });
 }
 
 fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {

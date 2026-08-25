@@ -1187,6 +1187,7 @@ fn waitForInteractiveCallback(
     listener: *std.Io.net.Server,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
 ) !void {
+    if (comptime builtin.os.tag == .windows) return error.Unsupported;
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
@@ -1794,8 +1795,8 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
-    if (comptime host_target.is_wasm) return;
-    const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
+    if (comptime host_target.is_wasm or builtin.os.tag == .windows) return;
+    const timeout = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
     const bytes = std.mem.asBytes(&timeout);
     std.posix.setsockopt(
         socket,

@@ -438,10 +438,15 @@ pub fn readMetadataPrefix(alloc: std.mem.Allocator, file: *std.Io.File, file_siz
     const readable_size = @min(file_size, max_frontmatter_bytes + 1);
     var scanner: ?SkillMetadataScanner = null;
     var metadata_complete = false;
+    // Zig 0.16 can route positional reads on Windows through the
+    // cancellation state machine even for an ordinary skill file. This scan
+    // is sequential and bounded, so keep the file cursor and avoid that path.
+    var reader_buffer: [8192]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &reader_buffer);
 
     while (content.items.len < readable_size) {
         const wanted = @min(chunk.len, readable_size - content.items.len);
-        const read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], content.items.len);
+        const read = reader.interface.readSliceShort(chunk[0..wanted]) catch return error.Unexpected;
         if (read == 0) return error.UnexpectedEndOfFile;
         try content.appendSlice(alloc, chunk[0..read]);
 

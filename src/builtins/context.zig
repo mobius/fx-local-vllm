@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const background_runtime = @import("../core/background/background_runtime.zig");
 const change_tracker = @import("../core/workspace/change_tracker.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -544,7 +545,11 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
         };
     } else std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{
         .allow_directory = false,
-        .follow_symlinks = false,
+        // Zig 0.16 models a no-follow Windows handle as asynchronous while
+        // the returned File metadata says synchronous. Context sources are
+        // regular files after the no-follow stat above; use a synchronous
+        // open for the normal path so sequential reads remain valid.
+        .follow_symlinks = if (comptime builtin.os.tag == .windows) true else false,
     }) catch |err| {
         return switch (err) {
             error.FileNotFound, error.NotDir => .missing,
@@ -557,38 +562,54 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
 
     const opened_stat = file.stat(io_mod.getIo()) catch return .{ .omitted = .unreadable };
     if (opened_stat.kind != .file) return .{ .omitted = if (stat.kind == .sym_link) .symlink else .non_regular };
+    if (comptime builtin.os.tag == .windows) {
+        // The normal Windows compatibility path follows the final component
+        // only because Zig 0.16's no-follow handle is opened asynchronously.
+        // Compare the file identity captured by the no-follow stat to close
+        // the replacement race before consuming any bytes.
+        if (stat.kind == .file and opened_stat.inode != stat.inode) {
+            return .{ .omitted = .symlink };
+        }
+    }
     const observed_bytes = std.math.cast(usize, opened_stat.size) orelse return .{ .omitted = .oversized };
     if (observed_bytes > context_limits.emergency_ceiling_bytes) return .{ .omitted = .oversized };
 
-    const has_content = validateRuleUtf8(&file, observed_bytes) catch
+    // Zig 0.16's Windows positional reader can report STATUS_CANCELLED for a
+    // regular synchronous handle and then hit an internal `unreachable` in
+    // the cancellation state machine. Context files are small, sequential
+    // inputs, so use the streaming reader on every platform here. This also
+    // keeps the Windows path independent of the positional-read regression.
+    const content = try arena.alloc(u8, observed_bytes);
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
+    var bytes_read: usize = 0;
+    while (bytes_read < observed_bytes) {
+        const chunk = reader.interface.readSliceShort(content[bytes_read..]) catch
+            return .{ .omitted = .unreadable };
+        if (chunk == 0) break;
+        bytes_read += chunk;
+    }
+    if (bytes_read != observed_bytes) return .{ .omitted = .unreadable };
+    const has_content = validateRuleUtf8(content) catch
         return .{ .omitted = .unreadable };
     if (!has_content) return .blank;
-    const read_len = @min(
-        observed_bytes,
-        @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes),
-    );
-    const content = try arena.alloc(u8, read_len);
-    const bytes_read = file.readPositionalAll(io_mod.getIo(), content, 0) catch
-        return .{ .omitted = .unreadable };
-    if (bytes_read != read_len) return .{ .omitted = .unreadable };
     const prefix_len = context_limits.lineSafePrefixLength(content, limit.effectiveBytes());
     const trimmed = std.mem.trim(u8, content[0..prefix_len], trim_chars);
     return .{ .body = .{ .text = trimmed, .observed_bytes = observed_bytes } };
 }
 
-fn validateRuleUtf8(file: *std.Io.File, byte_count: usize) !bool {
+fn validateRuleUtf8(content: []const u8) !bool {
     var read_offset: usize = 0;
     var has_content = false;
     var validator: text_utils.IncrementalUtf8Validator = .{};
-    var chunk: [16 * 1024]u8 = undefined;
+    const chunk_size = 16 * 1024;
 
-    while (read_offset < byte_count) {
-        const wanted = @min(chunk.len, byte_count - read_offset);
-        const bytes_read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], read_offset);
-        if (bytes_read != wanted) return error.UnexpectedEndOfFile;
-        if (std.mem.trim(u8, chunk[0..bytes_read], trim_chars).len != 0) has_content = true;
-        try validator.append(chunk[0..bytes_read]);
-        read_offset += bytes_read;
+    while (read_offset < content.len) {
+        const end = @min(read_offset + chunk_size, content.len);
+        const chunk = content[read_offset..end];
+        if (std.mem.trim(u8, chunk, trim_chars).len != 0) has_content = true;
+        try validator.append(chunk);
+        read_offset = end;
     }
     try validator.finish();
     return has_content;

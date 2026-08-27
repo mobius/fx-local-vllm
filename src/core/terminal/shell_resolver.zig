@@ -14,6 +14,26 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
+const ShellKind = enum { bash, zsh };
+
+fn shellKind(path: []const u8) ?ShellKind {
+    const basename = std.fs.path.basename(path);
+    if (std.mem.eql(u8, basename, "bash")) return .bash;
+    if (std.mem.eql(u8, basename, "zsh")) return .zsh;
+    return null;
+}
+
+fn fallbackLoginShell() []const u8 {
+    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+}
+
+fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
+    const path = configured_login_shell orelse return error.MissingLoginShell;
+    if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
+    if (shellKind(path) != null) return path;
+    return fallbackLoginShell();
+}
+
 pub const Invocation = struct {
     path: []const u8,
     values: [6][]const u8 = @splat(""),
@@ -44,7 +64,7 @@ pub fn resolve(
     };
     const selection: Selection = switch (shell) {
         .user_login => .{
-            .path = configured_login_shell orelse return error.MissingLoginShell,
+            .path = try supportedLoginShell(configured_login_shell),
             .clean_start = false,
         },
         .executable => |value| .{
@@ -56,13 +76,7 @@ pub fn resolve(
         return error.RelativeShellPath;
     }
 
-    const kind: enum { bash, zsh } =
-        if (std.mem.eql(u8, std.fs.path.basename(selection.path), "bash"))
-            .bash
-        else if (std.mem.eql(u8, std.fs.path.basename(selection.path), "zsh"))
-            .zsh
-        else
-            return error.UnsupportedShell;
+    const kind = shellKind(selection.path) orelse return error.UnsupportedShell;
 
     var result = Invocation{ .path = selection.path };
     result.append(selection.path);
@@ -116,10 +130,10 @@ pub fn environment(
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
     const selected = profile orelse .user;
-    const path = configured_login_shell orelse return error.MissingLoginShell;
-    _ = try resolve(path, switch (selected) {
+    const path = try supportedLoginShell(configured_login_shell);
+    _ = try resolve(null, switch (selected) {
         .clean => .{ .executable = .{ .path = path, .clean_start = true } },
-        .user => .user_login,
+        .user => .{ .executable = .{ .path = path } },
     });
     return switch (selected) {
         .clean => .{ .clean = try alloc.dupe(u8, path) },
@@ -134,18 +148,32 @@ pub fn profileShell(
 ) (ResolveError || Allocator.Error)!contracts.ShellSpec {
     return switch (profile) {
         .clean => blk: {
-            const path = configured_login_shell orelse return error.MissingLoginShell;
-            _ = try resolve(path, .{ .executable = .{ .path = path, .clean_start = true } });
+            const path = try supportedLoginShell(configured_login_shell);
+            _ = try resolve(null, .{ .executable = .{ .path = path, .clean_start = true } });
             break :blk .{ .executable = .{
                 .path = try alloc.dupe(u8, path),
                 .clean_start = true,
             } };
         },
-        .user => .user_login,
+        .user => blk: {
+            const configured = configured_login_shell orelse
+                break :blk .user_login;
+            const path = try supportedLoginShell(configured);
+            if (std.mem.eql(u8, path, configured)) break :blk .user_login;
+            break :blk .{ .executable = .{
+                .path = try alloc.dupe(u8, path),
+            } };
+        },
     };
 }
 
-pub fn capturedInvocation(environment_value: Environment, command: []const u8) ResolveError!Invocation {
+const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
+
+pub fn capturedInvocation(
+    alloc: Allocator,
+    environment_value: Environment,
+    command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
         .clean => |path| {
@@ -164,7 +192,11 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
                 invocation.append("-O");
                 invocation.append("expand_aliases");
             }
-            invocation.setCommand(command);
+            const effective_command = if (shellKind(path) == .zsh)
+                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, command })
+            else
+                command;
+            invocation.setCommand(effective_command);
             return invocation;
         },
     }
@@ -331,35 +363,68 @@ test "resolver rejects missing relative and unsupported shells" {
     );
 }
 
+test "login shell resolution falls back without accepting explicit unsupported shells" {
+    const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
+    try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
+    if (builtin.os.tag == .macos) {
+        try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ "/bin/zsh", "-l", "-i" },
+            fallback.argv(),
+        );
+    } else {
+        try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ "/bin/bash", "--login", "-i" },
+            fallback.argv(),
+        );
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedShell,
+        resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
+    );
+}
+
 test "captured profiles use exact non-PTY argv" {
-    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/zsh", "-f", "-c", "printf clean" },
         zsh_clean.argv(),
     );
-    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
-        zsh_user.argv(),
-    );
+    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "printf user");
+    const expected_zsh_user = [_][]const u8{
+        "/bin/zsh",
+        "-l",
+        "-i",
+        "-c",
+        "\\builtin trap - TERM; printf user",
+    };
+    try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
+    for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {
-    const invocation = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf '%s' ok");
+    const invocation = try capturedInvocation(std.testing.allocator, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
     const command = try formatInvocationCommand(std.testing.allocator, &invocation);
     defer std.testing.allocator.free(command);
     try std.testing.expectEqualStrings(
@@ -380,6 +445,32 @@ test "profile normalization defaults captured and persistent execution to user" 
     try std.testing.expectEqualStrings(
         "/bin/zsh",
         (try profileShell(arena, "/bin/zsh", .clean)).executable.path,
+    );
+}
+
+test "unsupported login shell profiles fall back for captured and persistent execution" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const fallback = fallbackLoginShell();
+    const user_environment = try environment(arena, "/opt/homebrew/bin/fish", .user);
+    const clean_environment = try environment(arena, "/opt/homebrew/bin/fish", .clean);
+    try std.testing.expect(user_environment.eql(.{ .user = fallback }));
+    try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
+
+    const user_invocation = try capturedInvocation(arena, user_environment, "printf user");
+    const clean_invocation = try capturedInvocation(arena, clean_environment, "printf clean");
+    try std.testing.expectEqualStrings(fallback, user_invocation.path);
+    try std.testing.expectEqualStrings(fallback, clean_invocation.path);
+
+    try std.testing.expectEqualStrings(
+        fallback,
+        (try profileShell(arena, "/opt/homebrew/bin/fish", .user)).executable.path,
+    );
+    try std.testing.expectEqualStrings(
+        fallback,
+        (try profileShell(arena, "/opt/homebrew/bin/fish", .clean)).executable.path,
     );
 }
 

@@ -92,6 +92,8 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    chatgpt_subscription,
+    grok_subscription,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
@@ -303,6 +305,7 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
+    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
@@ -731,6 +734,7 @@ pub const PersistedToolResult = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -751,6 +755,83 @@ pub const CancelledCommandPresentation = struct {
 pub const CommandProcessPresentation = union(enum) {
     exit_code: i64,
     signal: u32,
+    timed_out,
+    output_capture_failed,
+};
+
+pub const TerminalReturnPresentation = union(enum) {
+    started,
+    condition_met,
+    safety_ceiling,
+    cancelled,
+    exited: i32,
+    signal: u32,
+};
+
+pub const TerminalFailurePresentation = enum {
+    invalid_request,
+    path_outside_workspace,
+    unsupported_host,
+    shell_unavailable,
+    pty_unavailable,
+    startup_failed,
+    process_identity_unavailable,
+    session_lost,
+    session_not_found,
+    invalid_lifecycle,
+    authority_denied,
+    authority_retired,
+    lease_conflict,
+    cursor_gap,
+    screen_unavailable,
+    monitor_unavailable,
+    protocol_incompatible,
+    capacity_exceeded,
+    cancelled,
+
+    pub fn detail(self: TerminalFailurePresentation) []const u8 {
+        return switch (self) {
+            .invalid_request => "invalid request",
+            .path_outside_workspace => "path is outside the workspace",
+            .unsupported_host => "terminal host is unavailable",
+            .shell_unavailable => "terminal shell is unavailable",
+            .pty_unavailable => "terminal PTY is unavailable",
+            .startup_failed => "terminal startup failed",
+            .process_identity_unavailable => "terminal process identity is unavailable",
+            .session_lost => "terminal session was lost",
+            .session_not_found => "terminal session not found",
+            .invalid_lifecycle => "terminal session is in an invalid lifecycle state",
+            .authority_denied => "terminal authority denied",
+            .authority_retired => "saved terminal authority is from an older fx version; start a new terminal",
+            .lease_conflict => "terminal control lease conflict",
+            .cursor_gap => "terminal output cursor gap",
+            .screen_unavailable => "terminal screen is unavailable",
+            .monitor_unavailable => "terminal monitor is unavailable",
+            .protocol_incompatible => "terminal protocol is incompatible",
+            .capacity_exceeded => "terminal capacity exceeded",
+            .cancelled => "terminal action was cancelled",
+        };
+    }
+};
+
+pub const TerminalActionPresentation = union(enum) {
+    returned: TerminalReturnPresentation,
+    failed: TerminalFailurePresentation,
+
+    pub fn outcomeKind(self: TerminalActionPresentation) ToolOutcomeKind {
+        return switch (self) {
+            .returned => |returned| switch (returned) {
+                .started, .condition_met, .safety_ceiling => .completed,
+                .cancelled => .cancelled,
+                .exited => |code| if (code == 0) .completed else .failed,
+                .signal => .failed,
+            },
+            .failed => |failed| if (failed == .cancelled)
+                .cancelled
+            else
+                .failed,
+        };
+    }
 };
 
 pub const deferred_tool_result_output = "Not executed";
@@ -810,6 +891,7 @@ pub const ToolResultMemory = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const ToolExecutionStep = struct {
@@ -866,6 +948,9 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
+    /// The value is a validated JSON array and is never sent across provider routes.
+    provider_state_json: ?[]const u8 = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
@@ -875,11 +960,14 @@ pub const ChatMessage = struct {
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
+    cache_read_tokens: ?u64 = null,
+    cache_write_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
 };
 
-/// Exact usage metadata returned by a completed Gateway stream. `model` is
+/// Exact usage metadata returned by a completed provider stream. `model` is
 /// owned by the completion carrying this value.
-pub const GatewayBilling = struct {
+pub const ProviderBilling = struct {
     created_at_ms: i64,
     model: []const u8,
     total_cost: f64,
@@ -948,17 +1036,19 @@ pub const ProviderFinishReason = enum {
     }
 };
 
-pub const GatewayCompletion = struct {
+pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
-    billing: ?GatewayBilling = null,
+    billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
     provider_failure_detail: ?[]const u8 = null,
+    /// Provider-owned opaque response items for the next stateless request in this turn.
+    provider_state_json: ?[]const u8 = null,
     finish_reason: ?ProviderFinishReason = null,
     usage: Usage = .{},
 };
@@ -1136,7 +1226,7 @@ pub fn allToolCallsProviderExecuted(tool_calls: []const ToolCall) bool {
     return true;
 }
 
-pub fn classifyProviderCompletion(completion: GatewayCompletion) ProviderCompletionDisposition {
+pub fn classifyProviderCompletion(completion: ModelCompletion) ProviderCompletionDisposition {
     const finish_reason = completion.finish_reason orelse return .interrupted;
     return switch (finish_reason) {
         .provider_error, .content_filter => .provider_failure,
@@ -1261,7 +1351,7 @@ pub const AuthoritativeToolAdmission = union(enum) {
     reject_duplicate_identity,
 };
 
-pub fn authoritativeToolAdmission(completion: GatewayCompletion) AuthoritativeToolAdmission {
+pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeToolAdmission {
     if (completion.provider_result_identity_failure) |failure| {
         return .{ .reject_malformed_provider_result = failure };
     }
@@ -1474,6 +1564,8 @@ pub const FinishedPromptProjection = enum {
 };
 
 pub const SnapshotFileOwnership = struct {
+    /// Shared lifetime for snapshot files after worker completion. Copies must
+    /// retain/release; accepted history transfers deletion responsibility.
     ctx: *anyopaque,
     retain_fn: *const fn (*anyopaque) void,
     release_fn: *const fn (*anyopaque) void,
@@ -1515,37 +1607,10 @@ pub const RuleDecision = enum {
 
 pub const ContentHash = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
-pub const BackendKind = enum {
-    macos,
-    vercel,
-    just_bash,
-    none,
-    auto,
-
-    pub fn parse(raw: []const u8) ?BackendKind {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(trimmed, "macos")) return .macos;
-        if (std.ascii.eqlIgnoreCase(trimmed, "vercel")) return .vercel;
-        if (std.ascii.eqlIgnoreCase(trimmed, "just-bash")) return .just_bash;
-        if (std.ascii.eqlIgnoreCase(trimmed, "none")) return .none;
-        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
-        return null;
-    }
-
-    pub fn label(self: BackendKind) []const u8 {
-        return switch (self) {
-            .macos => "macos",
-            .vercel => "vercel",
-            .just_bash => "just-bash",
-            .none => "none",
-            .auto => "auto",
-        };
-    }
-};
-
 pub const ToolChoice = enum {
     auto,
     none,
+    required,
 
     pub fn label(self: ToolChoice) []const u8 {
         return @tagName(self);
@@ -1648,6 +1713,8 @@ pub const ReasoningEffort = union(enum) {
 pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
+    review_caution,
+    review_unavailable,
     policy_denied,
     permission_required,
 };
@@ -2151,6 +2218,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
     };
 }
 
@@ -2804,7 +2872,7 @@ test "public types remain constructible" {
     try std.testing.expectEqual(ChatRole.assistant, chat.role);
     try std.testing.expectEqualStrings("ok", chat.tool_calls[0].provider_result.?);
 
-    const completion = GatewayCompletion{
+    const completion = ModelCompletion{
         .content = "done",
         .tool_calls = &.{tool_call},
         .finish_reason = .stop,

@@ -45,6 +45,7 @@ pub fn makePersistedToolResult(
         .created_at_ms = io_mod.milliTimestamp(),
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
+        .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {
@@ -1238,7 +1239,7 @@ test "normal execution memory scans the deferred user tail by source call" {
         .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
         .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
         .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
-        .{ .role = .user, .content = "sandbox hint", .permission_feedback = false },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
         .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
     };
 

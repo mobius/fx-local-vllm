@@ -423,6 +423,14 @@ pub const CommitLifecycle = struct {
         ?*anyopaque,
         Allocator,
         session_codec.DurableSessionState,
+        CommitPosition,
+    ) anyerror!void = null,
+    write_deferred_fn: ?*const fn (
+        ?*anyopaque,
+        Allocator,
+        []const u8,
+        []const u8,
+        CommitPosition,
     ) anyerror!void = null,
     abort_fn: ?*const fn (?*anyopaque) void = null,
     deinit_fn: ?*const fn (?*anyopaque, Allocator) void = null,
@@ -436,13 +444,57 @@ pub const CommitLifecycle = struct {
         commit_lock_deadline_ms: u64,
     ) !void {
         if (self.prepare_fn) |callback| {
-            try callback(
+            callback(
                 self.context,
                 alloc,
                 session_id,
                 previous_workspace_root,
                 next_workspace_root,
                 commit_lock_deadline_ms,
+            ) catch |err| return switch (err) {
+                error.LatestCacheLockBusy => error.SessionCommitBoundaryUnavailable,
+                else => err,
+            };
+        }
+    }
+
+    fn prepareOpportunistic(
+        self: *CommitLifecycle,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        commit_lock_deadline_ms: u64,
+    ) !bool {
+        if (self.prepare_fn) |callback| {
+            callback(
+                self.context,
+                alloc,
+                session_id,
+                workspace_root,
+                workspace_root,
+                commit_lock_deadline_ms,
+            ) catch |err| return switch (err) {
+                error.LatestCacheLockBusy => true,
+                else => err,
+            };
+        }
+        return false;
+    }
+
+    fn writeDeferred(
+        self: *CommitLifecycle,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        position: CommitPosition,
+    ) !void {
+        if (self.write_deferred_fn) |callback| {
+            try callback(
+                self.context,
+                alloc,
+                session_id,
+                workspace_root,
+                position,
             );
         }
     }
@@ -451,8 +503,11 @@ pub const CommitLifecycle = struct {
         self: *CommitLifecycle,
         alloc: Allocator,
         state: session_codec.DurableSessionState,
+        position: CommitPosition,
     ) !void {
-        if (self.publish_fn) |callback| try callback(self.context, alloc, state);
+        if (self.publish_fn) |callback| {
+            try callback(self.context, alloc, state, position);
+        }
     }
 
     pub fn abort(self: *CommitLifecycle) void {
@@ -591,7 +646,13 @@ pub const LoadedWritableSession = struct {
         };
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
         self.state_replacement_pending = true;
-        try self.prepareCommitLifecycle(alloc, next_workspace_root, options);
+        const cache_deferred = switch (event) {
+            .workspace_rebound => blk: {
+                try self.prepareCommitLifecycle(alloc, next_workspace_root, options);
+                break :blk false;
+            },
+            else => try self.prepareCommitLifecycleOpportunistic(alloc, options),
+        };
         _ = appendEventImpl(
             self,
             alloc,
@@ -601,12 +662,13 @@ pub const LoadedWritableSession = struct {
             options,
             usage_sidecar_bytes,
             write_usage_sidecar,
+            cache_deferred,
         ) catch |err| {
             self.abortCommitLifecycle();
             return err;
         };
         if (!preserves_pristine_start) self.freshly_started = false;
-        const lifecycle_published = self.publishCommitLifecycle(alloc);
+        const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
             self.state_replacement_pending = true;
             return err;
@@ -638,7 +700,21 @@ pub const LoadedWritableSession = struct {
             null;
         defer if (usage_sidecar_bytes) |bytes| alloc.free(bytes);
         self.state_replacement_pending = true;
-        try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
+        const same_workspace = std.mem.eql(
+            u8,
+            self.state.workspace_root,
+            state.workspace_root,
+        );
+        const may_defer_cache = same_workspace and switch (reason) {
+            .compaction, .log_compaction => true,
+            .migration, .recovery => false,
+        };
+        const cache_deferred = if (may_defer_cache)
+            try self.prepareCommitLifecycleOpportunistic(alloc, options)
+        else blk: {
+            try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
+            break :blk false;
+        };
         _ = commitStateReplacementImpl(
             self,
             alloc,
@@ -648,12 +724,13 @@ pub const LoadedWritableSession = struct {
             options,
             usage_sidecar_bytes,
             true,
+            cache_deferred,
         ) catch |err| {
             self.abortCommitLifecycle();
             return err;
         };
         self.freshly_started = false;
-        const lifecycle_published = self.publishCommitLifecycle(alloc);
+        const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
             self.state_replacement_pending = true;
             return err;
@@ -683,9 +760,40 @@ pub const LoadedWritableSession = struct {
         }
     }
 
+    fn prepareCommitLifecycleOpportunistic(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        options: Options,
+    ) !bool {
+        if (self.commit_lifecycle) |*lifecycle| {
+            return lifecycle.prepareOpportunistic(
+                alloc,
+                self.active_id,
+                self.state.workspace_root,
+                options.commit_lock_deadline_ms,
+            );
+        }
+        return false;
+    }
+
+    fn writeDeferredCommitLifecycle(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        position: CommitPosition,
+    ) !void {
+        if (self.commit_lifecycle) |*lifecycle| {
+            try lifecycle.writeDeferred(
+                alloc,
+                self.active_id,
+                self.state.workspace_root,
+                position,
+            );
+        }
+    }
+
     pub fn publishCommitLifecycle(self: *LoadedWritableSession, alloc: Allocator) bool {
         if (self.commit_lifecycle) |*lifecycle| {
-            lifecycle.publish(alloc, self.state) catch |err| {
+            lifecycle.publish(alloc, self.state, self.position) catch |err| {
                 debug_trace.logf(
                     "session",
                     "event=latest_cache_publish_failed err={s}",
@@ -2925,6 +3033,7 @@ fn appendEventImpl(
     options: Options,
     usage_sidecar_bytes: ?[]const u8,
     write_usage_sidecar: bool,
+    cache_deferred: bool,
 ) !CommitPosition {
     try prepareCanonicalWrite(loaded, alloc, options);
     const envelope = session_event.Envelope{
@@ -2944,6 +3053,15 @@ fn appendEventImpl(
         envelope.event_id,
         .{ .event = envelope.event_id },
     );
+    if (cache_deferred) {
+        loaded.writeDeferredCommitLifecycle(
+            alloc,
+            prepared.proposed,
+        ) catch |err| {
+            prepared.deinit(alloc);
+            return err;
+        };
+    }
     return publishPreparedTail(
         loaded,
         alloc,
@@ -2980,6 +3098,7 @@ fn commitStateReplacementImpl(
     options: Options,
     usage_sidecar_bytes: ?[]const u8,
     write_usage_sidecar: bool,
+    cache_deferred: bool,
 ) !CommitPosition {
     try prepareCanonicalWrite(loaded, alloc, options);
     const timestamp_ms = state.updated_at_ms;
@@ -3012,6 +3131,15 @@ fn commitStateReplacementImpl(
             .final_event_id = summary.last_event_id,
         } },
     );
+    if (cache_deferred) {
+        loaded.writeDeferredCommitLifecycle(
+            alloc,
+            prepared.proposed,
+        ) catch |err| {
+            prepared.deinit(alloc);
+            return err;
+        };
+    }
     return publishPreparedTail(
         loaded,
         alloc,
@@ -4965,6 +5093,163 @@ test "usage sidecar publication stays inside the canonical commit boundary" {
     defer read_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), read_only.usage.?.next_sequence);
     try std.testing.expectEqual(@as(usize, 0), read_only.usage.?.incidents.len);
+}
+
+test "torn exact settlement restores stale sidecar backlog over settled rollback" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const TearSidecar = struct {
+        dir: *io_mod.VerifiedDir,
+        torn: bool = false,
+        const stale_file = "usage-v2.stale-test";
+
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_usage_sidecar_write) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.dir.dir.rename(
+                session_usage_sidecar.sidecar_file,
+                self.dir.dir,
+                stale_file,
+                io_mod.getIo(),
+            );
+            try self.dir.dir.createDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+                std.Io.File.Permissions.fromMode(0o700),
+            );
+            self.torn = true;
+        }
+
+        fn restore(self: *@This()) !void {
+            try self.dir.dir.deleteDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+            );
+            try self.dir.dir.rename(
+                stale_file,
+                self.dir.dir,
+                session_usage_sidecar.sidecar_file,
+                io_mod.getIo(),
+            );
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-torn-exact", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        const completion: types.ModelCompletion = .{
+            .generation_id = "response-torn-log",
+            .billing = .{
+                .created_at_ms = 100,
+                .model = "codex/gpt-test",
+                .total_cost = 0,
+                .input_tokens = 17,
+                .output_tokens = 7,
+                .cache_read_tokens = 2,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = 1,
+                .billable_web_search_calls = 0,
+            },
+        };
+
+        var checkpoint_context: u8 = 0;
+        var publication_context: u8 = 0;
+        var bridge = session_usage.Usage.initFresh();
+        defer bridge.deinit(alloc);
+        bridge.configureCheckpointSink(.{
+            .context = &checkpoint_context,
+            .allocator = alloc,
+            .persist = Checkpoint.persist,
+        });
+        bridge.configurePublicationSink(.{
+            .context = &publication_context,
+            .allocator = alloc,
+            .publish = RejectPublication.publish,
+        });
+        const bridge_observation = try session_usage.InvocationObservation.begin(&bridge);
+        try bridge_observation.complete(alloc, completion, .{ .exact = .codex });
+        var bridge_snapshot = try bridge.snapshot(alloc);
+        defer bridge_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.pending.len);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.publication_backlog.len);
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = bridge_snapshot } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+
+        var settled = session_usage.Usage.initFresh();
+        defer settled.deinit(alloc);
+        const settled_observation = try session_usage.InvocationObservation.begin(&settled);
+        try settled_observation.complete(alloc, completion, .{ .exact = .codex });
+        var settled_snapshot = try settled.snapshot(alloc);
+        defer settled_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 17), settled_snapshot.input_tokens);
+        try std.testing.expectEqual(@as(usize, 0), settled_snapshot.pending.len);
+
+        var tear = TearSidecar{ .dir = &loaded.log.dir };
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = settled_snapshot } },
+            30,
+            .retry_expected_tail,
+            .{ .test_controls = .{
+                .context = &tear,
+                .boundary_fn = TearSidecar.boundary,
+            } },
+        );
+        try std.testing.expect(tear.torn);
+        try tear.restore();
+    }
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    const recovered = read_only.usage.?;
+    try std.testing.expectEqual(@as(u64, 17), recovered.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), recovered.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), recovered.request_count);
+    try std.testing.expectEqual(@as(usize, 0), recovered.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.publication_backlog.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.incidents.len);
+
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFresh();
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, recovered, 1);
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), final.request_count);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
 }
 
 test "indeterminate canonical usage retry repairs the rich sidecar" {

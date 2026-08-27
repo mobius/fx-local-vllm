@@ -7,7 +7,6 @@ const command_output_content = @import("../../core/tooling/command_output_conten
 const assistant_wrap = @import("assistant_wrap.zig");
 const transcript_measure = @import("transcript_measure.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
-const presentation_mode = @import("../../core/config/presentation_mode.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
@@ -1516,7 +1515,7 @@ pub fn renderEntryToBlock(
     cols: u16,
     styles: Styles,
 ) !RenderedBlock {
-    return renderEntryToBlockForPresentation(alloc, entry, cols, styles, .compact, .legacy);
+    return renderEntryToBlockForPresentation(alloc, entry, cols, styles, .compact);
 }
 
 fn renderEntryToBlockForPresentation(
@@ -1525,7 +1524,6 @@ fn renderEntryToBlockForPresentation(
     cols: u16,
     styles: Styles,
     presentation: TranscriptPresentation,
-    maxxing_mode: presentation_mode.MaxxingMode,
 ) !RenderedBlock {
     return renderEntryToBlockForPresentationInterruptible(
         alloc,
@@ -1533,7 +1531,6 @@ fn renderEntryToBlockForPresentation(
         cols,
         styles,
         presentation,
-        maxxing_mode,
         null,
     ) catch |err| switch (err) {
         error.InputPending => unreachable,
@@ -1547,7 +1544,6 @@ fn renderEntryToBlockForPresentationInterruptible(
     cols: u16,
     styles: Styles,
     presentation: TranscriptPresentation,
-    maxxing_mode: presentation_mode.MaxxingMode,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !RenderedBlock {
     const kind = blockKindForEntry(entry);
@@ -1590,24 +1586,28 @@ fn renderEntryToBlockForPresentationInterruptible(
                 e.turn.images,
                 cols,
                 e.skill_tokens,
-                maxxing_mode,
                 checkpoint,
             );
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
         },
         .assistant_turn => |e| blk: {
-            const wrapped = try assistant_wrap.wrapTranscriptAssistantTextInterruptible(
+            const wrapped = try assistant_wrap.wrapTranscriptAssistantTextWithFinalityInterruptible(
                 alloc,
                 e.segments.text.items,
                 cols,
                 checkpoint,
             );
-            break :blk try normalizeOwnedRenderedBlockWithAllocation(
+            const trimmed = trimAssistantBlockHead(wrapped.bytes);
+            const trimmed_head_bytes = wrapped.bytes.len - trimmed.len;
+            var block = try normalizeOwnedRenderedBlockWithAllocation(
                 alloc,
                 kind,
-                trimAssistantBlockHead(wrapped),
-                wrapped,
+                trimmed,
+                wrapped.bytes,
             );
+            block.assistant_finalized_prefix_bytes =
+                wrapped.finalized_prefix_bytes -| trimmed_head_bytes;
+            break :blk block;
         },
         .assistant_table => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
@@ -1704,7 +1704,6 @@ pub fn renderEntriesForFullPresentationInterruptible(
             cols,
             styles,
             .full,
-            .minimal,
             checkpoint,
         );
         defer block.deinit(alloc);
@@ -1738,7 +1737,6 @@ test "auto permission notice contributes content only to full presentation" {
         80,
         .{},
         .compact,
-        .legacy,
     );
     defer compact.deinit(alloc);
     try std.testing.expectEqual(TranscriptBlockKind.system_notice, compact.kind);
@@ -1750,7 +1748,6 @@ test "auto permission notice contributes content only to full presentation" {
         80,
         .{},
         .full,
-        .legacy,
     );
     defer full.deinit(alloc);
     try std.testing.expectEqual(TranscriptBlockKind.system_notice, full.kind);
@@ -1927,14 +1924,13 @@ const RenderEntriesOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
     finality_entry_ids: []const u32 = &.{},
-    finality_entry_start_bytes: []?usize = &.{},
+    finality_entry_floor_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     summary_entry_ids: []const ?u32 = &.{},
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
-    maxxing_mode: presentation_mode.MaxxingMode = .legacy,
 
     fn resetSummaryIndices(self: RenderEntriesOptions) void {
         std.debug.assert(self.summary_entry_ids.len == self.summary_transcript_indices.len);
@@ -2044,7 +2040,8 @@ const RenderEntriesBuilder = struct {
         if (options.target_byte_entry_id == entry_id) self.target_entry_start_byte = self.out.items.len;
         for (options.finality_entry_ids, 0..) |finality_entry_id, index| {
             if (finality_entry_id == entry_id) {
-                options.finality_entry_start_bytes[index] = self.out.items.len;
+                options.finality_entry_floor_bytes[index] = self.out.items.len +
+                    (block.assistant_finalized_prefix_bytes orelse 0);
             }
         }
         for (options.summary_entry_ids, 0..) |summary_entry_id, index| {
@@ -2094,6 +2091,7 @@ fn renderEntriesInterruptible(
     options: RenderEntriesOptions,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !RenderedEntries {
+    std.debug.assert(options.finality_entry_ids.len == options.finality_entry_floor_bytes.len);
     options.resetSummaryIndices();
     if (options.entry_actions.len > 0) {
         std.debug.assert(options.entry_actions.len == entries.len);
@@ -2122,7 +2120,6 @@ fn renderEntriesInterruptible(
             cols,
             styles,
             .compact,
-            options.maxxing_mode,
             checkpoint,
         );
         defer block.deinit(alloc);
@@ -2149,11 +2146,9 @@ pub fn renderEntriesWithOverridesToBytes(
     cols: u16,
     styles: Styles,
     entry_overrides: []const EntryRenderOverride,
-    maxxing_mode: presentation_mode.MaxxingMode,
 ) ![]u8 {
     return (try renderEntries(alloc, entries, cols, styles, .{
         .entry_overrides = entry_overrides,
-        .maxxing_mode = maxxing_mode,
     })).bytes;
 }
 
@@ -2163,11 +2158,9 @@ pub fn renderEntriesWithProjectionToBytes(
     cols: u16,
     styles: Styles,
     entry_actions: []const EntryRenderAction,
-    maxxing_mode: presentation_mode.MaxxingMode,
 ) ![]u8 {
     return (try renderEntries(alloc, entries, cols, styles, .{
         .entry_actions = entry_actions,
-        .maxxing_mode = maxxing_mode,
     })).bytes;
 }
 
@@ -2191,7 +2184,6 @@ test "compact projection overrides its first entry and hides later entries" {
         80,
         .{},
         &actions,
-        .minimal,
     );
     defer alloc.free(rendered);
 
@@ -2275,13 +2267,14 @@ pub const TranscriptPreparationOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
     finality_entry_ids: []const u32 = &.{},
-    finality_entry_start_bytes: []?usize = &.{},
+    /// Parallel to `finality_entry_ids`. Each rendered nomination writes the
+    /// first byte that remains mutable; immutable entries use their start.
+    finality_entry_floor_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
-    maxxing_mode: presentation_mode.MaxxingMode = .legacy,
 };
 
 pub fn renderEntriesForPreparation(
@@ -2325,14 +2318,13 @@ pub fn renderEntriesForPreparationInterruptible(
             .target_entry_id = options.target_entry_id,
             .target_byte_entry_id = options.target_byte_entry_id,
             .finality_entry_ids = options.finality_entry_ids,
-            .finality_entry_start_bytes = options.finality_entry_start_bytes,
+            .finality_entry_floor_bytes = options.finality_entry_floor_bytes,
             .omitted_entry_id = options.omitted_entry_id,
             .entry_actions = options.entry_actions,
             .summary_entry_ids = options.folded_summary_entry_ids,
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
-            .maxxing_mode = options.maxxing_mode,
         },
         checkpoint,
     );
@@ -2658,6 +2650,7 @@ pub const RenderedBlock = struct {
     stored_tail_newlines: usize,
     allocation: []const u8 = &.{},
     owned: bool = false,
+    assistant_finalized_prefix_bytes: ?usize = null,
 
     pub fn deinit(self: RenderedBlock, alloc: Allocator) void {
         if (self.owned) alloc.free(self.allocation);
@@ -3572,9 +3565,9 @@ test "compact presentation hides context notices while full presentation retains
     try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary system notice") != null);
     try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary error notice") != null);
 
-    const first_full = try renderEntryToBlockForPresentation(alloc, entries.items[0], 80, .{}, .full, .legacy);
+    const first_full = try renderEntryToBlockForPresentation(alloc, entries.items[0], 80, .{}, .full);
     defer first_full.deinit(alloc);
-    const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full, .legacy);
+    const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
     defer second_full.deinit(alloc);
     try std.testing.expectEqualStrings("● Context: first warning", first_full.bytes);
     try std.testing.expectEqualStrings("● Context: second warning", second_full.bytes);
@@ -4341,7 +4334,8 @@ test "renderEntriesToBytes rebuilds user card at paint-time cols" {
     defer alloc.free(narrow);
 
     try std.testing.expect(narrow.len > wide.len);
-    try std.testing.expect(std.mem.startsWith(u8, wide, user_message_card.user_message_style));
+    try std.testing.expect(std.mem.startsWith(u8, wide, user_message_card.promptMarkerStyle()));
+    try std.testing.expect(std.mem.find(u8, wide, "┃") != null);
     try std.testing.expect(std.mem.find(u8, wide, "this is") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "this is") != null);
 }
@@ -4388,8 +4382,9 @@ test "renderEntriesToBytes preserves selected skill token spans through user car
     try std.testing.expect(std.mem.find(u8, narrow, "\x1b[38;5;252mreview") != null);
 }
 
-test "renderEntriesToBytes keeps truecolor user cards scoped through reflow" {
+test "renderEntriesToBytes keeps current user rails scoped through reflow" {
     const alloc = std.testing.allocator;
+    user_message_card.setStyle(false, null);
     user_message_card.setStyle(false, .{ .r = 20, .g = 80, .b = 140 });
     defer user_message_card.setStyle(false, null);
 
@@ -4398,7 +4393,6 @@ test "renderEntriesToBytes keeps truecolor user cards scoped through reflow" {
     try appendUserTestEntry(&entries, alloc, 1, "this submitted prompt should wrap at narrow widths");
     try appendRawTestEntry(&entries, alloc, 2, "Z", .unknown_raw);
 
-    const card_bg = vt_emulator.Color{ .rgb = .{ .r = 57, .g = 108, .b = 158 } };
     for ([_]u16{ 80, 30 }) |cols| {
         const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
         defer alloc.free(out);
@@ -4413,10 +4407,10 @@ test "renderEntriesToBytes keeps truecolor user cards scoped through reflow" {
             var col: u16 = 1;
             while (col <= grid.cols) : (col += 1) {
                 const cell = grid.cellAt(row, col).?;
-                if (cell.codepoint == '❯') {
+                if (cell.codepoint == '┃') {
                     prompt_found = true;
-                    try std.testing.expect(cell.style.bg.eql(card_bg));
-                    try std.testing.expect(cell.style.fg.eql(.{ .rgb = .{ .r = 255, .g = 255, .b = 255 } }));
+                    try std.testing.expect(cell.style.bg.eql(.default));
+                    try std.testing.expect(cell.style.fg.eql(.{ .indexed = 255 }));
                 }
                 if (cell.codepoint == 'Z') {
                     following_entry_found = true;
@@ -4430,7 +4424,7 @@ test "renderEntriesToBytes keeps truecolor user cards scoped through reflow" {
     }
 }
 
-test "minimal maxxing reflows user prompts without card background" {
+test "current compact rendering reflows user prompts without card background" {
     const alloc = std.testing.allocator;
     user_message_card.setStyle(false, .{ .r = 20, .g = 80, .b = 140 });
     defer user_message_card.setStyle(false, null);
@@ -4439,7 +4433,7 @@ test "minimal maxxing reflows user prompts without card background" {
     defer deinitTestEntries(&entries, alloc);
     try appendUserTestEntry(&entries, alloc, 1, "minimal prompt");
 
-    const out = try renderEntriesWithOverridesToBytes(alloc, entries.items, 80, .{}, &.{}, .minimal);
+    const out = try renderEntriesWithOverridesToBytes(alloc, entries.items, 80, .{}, &.{});
     defer alloc.free(out);
 
     try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[38;5;255m┃\x1b[0m \x1b[1mminimal prompt"));

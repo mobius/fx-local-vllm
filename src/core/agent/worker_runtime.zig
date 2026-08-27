@@ -6,7 +6,6 @@ const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const context_contract = @import("../workspace/context_contract.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
@@ -18,6 +17,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 
 pub const AgentTurnSettings = struct {
@@ -60,11 +60,12 @@ pub const QueuedPrompt = struct {
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
     model: []u8,
+    provider: model_provider.ProviderId = .gateway,
     api_key: []u8,
     gateway_team: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     history: []types.HistoryTurn,
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
@@ -81,13 +82,20 @@ pub const QueuedPrompt = struct {
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
     recovery_source_already_presented: bool = false,
+    /// The interactive transcript already contains this exact user turn.
+    /// Worker begin publishes only its identity so the UI can consume the
+    /// pending owner without painting a duplicate card.
+    user_prompt_already_presented: bool = false,
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
+    /// Owns snapshot deletion until the files are transferred to accepted
+    /// history or handed to a reference-counted finished-turn owner.
     images: []const types.ImageAttachment,
     state: enum {
         active,
         handed_off,
+        preserved,
         discarded,
     } = .active,
     shared_ownership: ?types.SnapshotFileOwnership = null,
@@ -115,6 +123,23 @@ pub const ActivePromptSnapshotOwnership = struct {
         const ownership = (try self.ensureSharedOwnership(alloc)).?;
         self.state = .handed_off;
         return ownership;
+    }
+
+    fn preserve(self: *ActivePromptSnapshotOwnership) bool {
+        if (self.images.len == 0) return false;
+        switch (self.state) {
+            .active => {
+                if (self.shared_ownership) |ownership| ownership.transfer();
+                self.state = .preserved;
+                return true;
+            },
+            .handed_off => {
+                if (self.shared_ownership) |ownership| ownership.transfer();
+                return true;
+            },
+            .preserved => return true,
+            .discarded => return false,
+        }
     }
 
     fn deinit(self: *ActivePromptSnapshotOwnership) void {
@@ -180,9 +205,38 @@ const SnapshotFileOwnershipState = struct {
     }
 };
 
+fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
+    return switch (turn) {
+        .assistant => |value| value.user.images,
+        .background_command => |value| value.user.images,
+        .interrupted => |value| value.user.images,
+        .compacted_summary => &.{},
+    };
+}
+
+fn sameImageSnapshots(
+    left: []const types.ImageAttachment,
+    right: []const types.ImageAttachment,
+) bool {
+    if (left.len == 0 or left.len != right.len) return false;
+    for (left) |image| {
+        const other = image_attachments.findById(right, image.id) orelse return false;
+        if (!optionalBytesEqual(image.snapshot_path, other.snapshot_path) or
+            !optionalBytesEqual(image.snapshot_sha256, other.snapshot_sha256))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
 pub const PermissionSnapshot = struct {
     mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
 };
 
 pub const CommandOutputChunk = struct {
@@ -452,6 +506,7 @@ pub const PendingQuestionBatchSnapshot = struct {
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
+    begin_presented_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
@@ -509,9 +564,9 @@ pub const WorkerRuntime = struct {
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
-    active_permission_snapshot: ?PermissionSnapshot = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
+    preserve_prompt_snapshot_turn_id: ?u64 = null,
 
     pub fn deinit(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         if (self.pending_permission_response) |response| {
@@ -1007,7 +1062,11 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
-        if (queued.recovery_checkpoint == null) {
+        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+            try self.worker_events.append(alloc, .{
+                .begin_presented_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_checkpoint == null) {
             const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
@@ -1068,6 +1127,12 @@ pub const WorkerRuntime = struct {
         while (self.worker_processing) {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
+    }
+
+    pub fn isProcessing(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.worker_processing;
     }
 
     pub fn snapshotState(
@@ -1132,6 +1197,31 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
+        self.clearQueuedPromptsLocked(alloc, retained_images);
+    }
+
+    /// Clears the queue while atomically transferring deletion responsibility
+    /// for a matching active or finished turn to the supplied retained images.
+    pub fn clearQueuedPromptsForSessionTransition(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn_id: u64,
+        retained_images: []const types.ImageAttachment,
+    ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        if (retained_images.len > 0) {
+            _ = self.preservePromptSnapshotsLocked(turn_id, retained_images);
+        }
+        self.clearQueuedPromptsLocked(alloc, retained_images);
+    }
+
+    fn clearQueuedPromptsLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        retained_images: []const types.ImageAttachment,
+    ) void {
         const dropped = self.queued_prompt_count;
         if (dropped > 0) {
             debug_trace.logf("worker", "clear queued prompts dropped={d}", .{dropped});
@@ -1167,7 +1257,6 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         for (self.queued_prompts.items) |*prompt| {
             prompt.permission_mode = snapshot.mode;
-            prompt.sandbox_backend = snapshot.sandbox_backend;
         }
     }
 
@@ -1203,24 +1292,6 @@ pub const WorkerRuntime = struct {
         return self.active_agent_turn_settings orelse self.agent_turn_settings;
     }
 
-    pub fn setActivePermissionSnapshot(self: *WorkerRuntime, snapshot: PermissionSnapshot) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = snapshot;
-    }
-
-    pub fn clearActivePermissionSnapshot(self: *WorkerRuntime) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = null;
-    }
-
-    pub fn effectivePermissionSnapshot(self: *WorkerRuntime, fallback: PermissionSnapshot) PermissionSnapshot {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        return self.active_permission_snapshot orelse fallback;
-    }
-
     pub fn syncQueuedPromptPermissionState(self: *WorkerRuntime, alloc: std.mem.Allocator, grants: []const types.PermissionGrant, snapshot: PermissionSnapshot) !void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1229,7 +1300,6 @@ pub const WorkerRuntime = struct {
             types.freePermissionGrantSlice(alloc, prompt.grants);
             prompt.grants = next_grants;
             prompt.permission_mode = snapshot.mode;
-            prompt.sandbox_backend = snapshot.sandbox_backend;
         }
     }
 
@@ -1337,7 +1407,13 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == null);
+        if (self.preserve_prompt_snapshot_turn_id == self.active_turn_id) {
+            _ = ownership.preserve();
+            self.preserve_prompt_snapshot_turn_id = null;
+        }
         self.active_prompt_snapshot_ownership = ownership;
     }
 
@@ -1345,6 +1421,8 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
     ) !?types.SnapshotFileOwnership {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         const ownership = self.active_prompt_snapshot_ownership orelse return null;
         return ownership.handoff(alloc);
     }
@@ -1353,9 +1431,44 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
+    }
+
+    fn preservePromptSnapshotsLocked(
+        self: *WorkerRuntime,
+        turn_id: u64,
+        images: []const types.ImageAttachment,
+    ) bool {
+        if (turn_id == 0 or images.len == 0) return false;
+
+        var preserved = false;
+        if (self.active_turn_id == turn_id) {
+            if (self.active_prompt_snapshot_ownership) |ownership| {
+                if (sameImageSnapshots(ownership.images, images)) {
+                    preserved = ownership.preserve();
+                }
+            } else {
+                // The unique active turn bridges queue take to ownership
+                // registration while both operations remain mutex-serialized.
+                self.preserve_prompt_snapshot_turn_id = turn_id;
+                preserved = true;
+            }
+        }
+        for (self.worker_events.items) |*event| {
+            if (event.* != .finish_prompt) continue;
+            const finished = &event.finish_prompt;
+            const finished_images = historyTurnImages(finished.turn);
+            if (!sameImageSnapshots(finished_images, images)) continue;
+            if (finished.snapshot_file_ownership) |ownership| {
+                ownership.transfer();
+                preserved = true;
+            }
+        }
+        return preserved;
     }
 
     pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
@@ -1716,7 +1829,7 @@ test "terminal recovery pause admits continuation before worker cleanup" {
                 .assistant_source = @constCast("partial response"),
                 .cause = .network_interrupted,
                 .action = .paused,
-                .route_model = @constCast("model"),
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
                 .requested_fast_mode = false,
                 .fast_mode = false,
                 .max_provider_attempts = 10,
@@ -1951,6 +2064,7 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     alloc.free(prompt.model);
     secret.zeroAndFree(alloc, prompt.api_key);
     if (prompt.gateway_team) |team| alloc.free(team);
+    if (prompt.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, prompt.history);
     if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
     types.freePermissionGrantSlice(alloc, prompt.grants);
@@ -2014,6 +2128,106 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
             std.Io.Dir.accessAbsolute(std.testing.io, path, .{}),
         );
     }
+}
+
+test "session transfer preserves active and finished prompt snapshots" {
+    const alloc = std.testing.allocator;
+    const phases = [_]enum { take_before_begin, active, finished }{
+        .take_before_begin,
+        .active,
+        .finished,
+    };
+    for (phases) |phase| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const name = switch (phase) {
+            .take_before_begin => "take-before-begin.bin",
+            .active => "active.bin",
+            .finished => "finished.bin",
+        };
+        {
+            var file = try tmp.dir.createFile(std.testing.io, name, .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "snapshot");
+        }
+        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(path);
+        const images = [_]types.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }};
+
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.active_turn_id = 41;
+        var active = ActivePromptSnapshotOwnership.init(&images);
+        if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase == .finished) {
+            const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
+                return error.TestExpectedSnapshotOwnership;
+            try runtime.pushEvent(alloc, .{ .finish_prompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
+                    .assistant = @constCast("done"),
+                } },
+                .snapshot_file_ownership = ownership,
+            } });
+            ownership.release();
+            runtime.endActivePromptSnapshots(&active);
+            runtime.active_turn_id = 0;
+        }
+
+        runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
+        if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase != .finished) runtime.endActivePromptSnapshots(&active);
+        runtime.discardEvents(alloc);
+        try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+        try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
+    }
+}
+
+test "session transfer discards mismatched active prompt snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "active.bin", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "snapshot");
+    }
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "active.bin");
+    defer alloc.free(path);
+    const active_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/source.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = path,
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    }};
+    const unrelated_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/other.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/other.bin"),
+        .snapshot_sha256 = @constCast("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.active_turn_id = 42;
+    var active = ActivePromptSnapshotOwnership.init(&active_images);
+    runtime.beginActivePromptSnapshots(&active);
+
+    runtime.clearQueuedPromptsForSessionTransition(alloc, 42, &unrelated_images);
+    runtime.endActivePromptSnapshots(&active);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, path, .{}),
+    );
 }
 
 test "accepted active prompt ownership does not delete history files" {
@@ -2506,6 +2720,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .skill_display_spans = skill_display_spans,
             } };
         },
+        .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -2579,6 +2794,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
+        .begin_presented_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -2754,6 +2970,7 @@ fn dupeToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 
@@ -2949,11 +3166,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
-    var first_prompt = try makePrompt(alloc, "first", "old");
-    first_prompt.sandbox_backend = .macos;
+    const first_prompt = try makePrompt(alloc, "first", "old");
     try runtime.enqueuePrompt(alloc, first_prompt);
-    var second_prompt = try makePrompt(alloc, "second", "old");
-    second_prompt.sandbox_backend = .macos;
+    const second_prompt = try makePrompt(alloc, "second", "old");
     try runtime.enqueuePrompt(alloc, second_prompt);
     try std.testing.expectEqual(@as(usize, 2), runtime.queuePreview().count);
 
@@ -2977,19 +3192,15 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expectEqualStrings("next", runtime.queued_prompts.items[0].model);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .ask,
-        .sandbox_backend = .none,
     });
     try std.testing.expectEqual(types.PermissionMode.ask, runtime.queued_prompts.items[0].permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, runtime.queued_prompts.items[0].sandbox_backend);
     try std.testing.expectEqual(types.PermissionMode.auto, job.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, job.sandbox_backend);
 
     const grant_source = try alloc.alloc(types.PermissionGrant, 1);
     defer types.freePermissionGrantSlice(alloc, grant_source);
     grant_source[0] = try makeGrant(alloc, "read_file", "/tmp/a");
     try runtime.syncQueuedPromptPermissionState(alloc, grant_source, .{
         .mode = .auto,
-        .sandbox_backend = .none,
     });
     grant_source[0].tool_name[0] = 'R';
     grant_source[0].target_path[1] = 'T';
@@ -3905,6 +4116,26 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
     try std.testing.expect(events.items[0] == .begin_prompt);
 }
 
+test "already-presented queued prompt emits identity without duplicating user payload" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var queued = try makePrompt(alloc, "already visible", "model");
+    queued.turn_id = 9001;
+    queued.user_prompt_already_presented = true;
+    try runtime.enqueuePrompt(alloc, queued);
+
+    const job = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, job);
+    var events = runtime.takeEvents();
+    defer freeEventList(alloc, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0] == .begin_presented_prompt);
+    try std.testing.expectEqual(@as(u64, 9001), events.items[0].begin_presented_prompt);
+}
+
 test "requestRecoveryPause wakes the active operation without losing pause intent" {
     var worker = WorkerRuntime{};
     worker.requestRecoveryPause();
@@ -4082,55 +4313,26 @@ test "effectiveAgentTurnSettings prefers active turn settings until cleared" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), fallback.effort);
 }
 
-test "effective permission snapshot keeps a held turn pair until cleared" {
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(std.testing.allocator);
-
-    runtime.setActivePermissionSnapshot(.{
-        .mode = .auto,
-        .sandbox_backend = .macos,
-    });
-    const active = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-        .sandbox_backend = .none,
-    });
-    try std.testing.expectEqual(types.PermissionMode.auto, active.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, active.sandbox_backend);
-
-    runtime.clearActivePermissionSnapshot();
-    const next = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-        .sandbox_backend = .none,
-    });
-    try std.testing.expectEqual(types.PermissionMode.ask, next.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, next.sandbox_backend);
-}
-
-test "queued permission pair updates from ask to auto without rewriting held turn" {
+test "queued permission mode updates without mutating dequeued fallback" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
     var held_prompt = try makePrompt(alloc, "held", "model");
     held_prompt.permission_mode = .ask;
-    held_prompt.sandbox_backend = .none;
     try runtime.enqueuePrompt(alloc, held_prompt);
     var queued_prompt = try makePrompt(alloc, "queued", "model");
     queued_prompt.permission_mode = .ask;
-    queued_prompt.sandbox_backend = .none;
     try runtime.enqueuePrompt(alloc, queued_prompt);
 
     const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, active);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .auto,
-        .sandbox_backend = .macos,
     });
 
     try std.testing.expectEqual(types.PermissionMode.ask, active.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, active.sandbox_backend);
     try std.testing.expectEqual(types.PermissionMode.auto, runtime.queued_prompts.items[0].permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, runtime.queued_prompts.items[0].sandbox_backend);
 }
 
 test "submitted text only queues while a prompt is active" {

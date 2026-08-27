@@ -101,3 +101,7 @@
 | working tree | Git 当前 checkout 中的源码、未提交修改和未跟踪文件集合；本轮按它相对 `origin/main` 的差异做分类，不假定所有修改都是本轮新建。 |
 | generated experiment artifact | 实验生成物；例如 `.e2e/` 下的 capture、截图、SPIR-V、ledger、trace 和 report，属于可复现实验证据，不是生产源码。 |
 | classification index | 分类索引；用主题入口把源码、脚本、fixture、第三方工具和实验记录关联起来，同时保留原始时间戳文档。 |
+| canonical upstream | canonical upstream；项目声明的权威上游仓库，本轮为 `vercel-labs/fx`，用于判断本地 fork 是否落后。 |
+| focused Windows smoke root | focused Windows smoke root；面向 Windows 可运行能力的独立 Zig 测试入口，通过真实构建二进制验证公开命令，不实例化平台不支持的 Unix 测试夹具。 |
+| POSIX full registry | POSIX full registry；上游为 Unix 进程、PTY、poll 和 signal 语义准备的全量测试注册表，不能直接等价移植到 Windows。 |
+| test root module | test root module；Zig 测试编译的根模块，决定哪些源文件和测试声明被实例化；本轮 Windows 与 POSIX 使用不同根模块。 |

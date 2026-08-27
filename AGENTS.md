@@ -138,13 +138,19 @@ Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `backg
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses Fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
+* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
 
 * Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
 
 * Session `always` approvals are non-persistent; command approvals match the exact command while other grant categories may use patterns
 
 * `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
+
+* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one review using the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+
+* A `clear` review authorizes only the exact unchanged action. A `caution` or unavailable review holds only that action, returns advice to the agent, and never opens a human permission screen, disables tools, or ends the turn
+
+* Exact cautions are reused only for the current turn. Changed actions receive a new review. Legacy `permission_request_id` input is rejected without prompting
 
 Do not bypass the permission system for new tools.
 
@@ -208,7 +214,7 @@ Do not bypass the permission system for new tools.
 
 * Zig unit tests go inside the source file they test, using `test "description" { ... }` blocks.
 
-* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in both Debug and ReleaseSafe in **Full CI** after the feature branch is pushed, and both modes must pass before the draft PR is marked ready.
+* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **Full CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
 
 * Use `std.testing.expect`, `std.testing.expectEqual`, `std.testing.expectEqualStrings` for assertions.
 
@@ -275,9 +281,9 @@ After the focused checks pass, create a clean checkpoint commit, push the non-`m
 * `macos-15-intel` (x86_64)
 * `macos-15` (aarch64)
 
-The native matrix builds, tests, and smoke-tests both Debug and ReleaseSafe on every platform; formatting runs only in the Debug jobs. The E2E matrix runs four duration-balanced, isolated shards per platform and optimization mode with Bun and tmux. Checked-in weights assign every test file to exactly one shard in each mode on each platform, and files inside a shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after its tmux server is reset. Live model evals remain separate because they require credentials and are not deterministic.
+The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. The E2E matrix runs four duration-balanced, isolated ReleaseSafe shards per platform with Bun and tmux. Checked-in weights assign every test file to exactly one shard on each platform, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after its tmux server is reset. Live model evals remain separate because they require credentials and are not deterministic.
 
-A Full CI result is valid only when it belongs to the exact current commit and all four `Full suite (...)` jobs succeed. Each platform aggregate requires successful Debug and ReleaseSafe native checks plus all four E2E shards in both modes. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
+A Full CI result is valid only when it belongs to the exact current commit and all four `Full suite (...)` jobs succeed. Each platform aggregate requires its ReleaseSafe native check plus all four ReleaseSafe E2E shards. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
 
 ## Reproducing Render Bugs
 

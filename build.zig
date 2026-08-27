@@ -82,8 +82,30 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (target.result.os.tag == .windows)
+        .{
+            .path = b.path("tests/windows_test_runner.zig"),
+            .mode = .simple,
+        }
+    else
+        null;
+    // The upstream root test imports a deliberately exhaustive registry of
+    // Unix integration fixtures. Keep that suite intact on POSIX, while the
+    // Windows build uses a focused smoke root that exercises the installed
+    // product without instantiating unsupported fork/PTY/poll test fixtures.
+    const test_root_module = if (target.result.os.tag == .windows) blk: {
+        const windows_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/windows_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        windows_test_module.addImport("build_options", build_options.createModule());
+        break :blk windows_test_module;
+    } else exe.root_module;
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_root_module,
+        .test_runner = test_runner,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());

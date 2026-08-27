@@ -71,6 +71,7 @@ pub const ParallelHookExecContext = struct {
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     session_grants: []const PermissionGrant,
+    permission_mode: types.PermissionMode,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     classification_complete: []const bool = &.{},
@@ -252,6 +253,7 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .result_allocator = alloc,
         .call = call,
         .authority = .ordinary,
+        .permission_mode = exec_ctx.permission_mode,
         .root_user_intent_context = exec_ctx.root_user_intent_context,
         .current_turn_messages = exec_ctx.current_turn_messages,
         .session_grants = exec_ctx.session_grants,
@@ -358,6 +360,7 @@ fn duplicateToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 

@@ -93,6 +93,7 @@ def build_prompt(context: dict[str, Any]) -> str:
         "所有必要信息已在本消息中，不需要读取上下文文件。必须先调用一次 write_file 工具，把严格 JSON 写入目标 patch 文件；不要调用 list、read、terminal、shell、网络或其他工具。\n"
         "JSON 至少包含：candidate_id（必须等于候选编号）、optimization_path、kind（shader 或 pass）、shader_files（相对文件名数组）。\n"
         "shader_files 只能是候选 shader 目录下的相对文件名；pass 方向必须使用空数组。\n"
+        "本项目当前唯一允许替换的 captured shader stem 是 sh144；shader 方向必须声明 sh144（推荐）或 sh144 的常见扩展名（如 .spv、.spirv、.spvasm、.comp、.frag），不要写其他 stem。\n"
         "只选择一个方向，不要伪造性能数字；写完文件后再用一句话说明方向。"
         + guidance_instruction
     )

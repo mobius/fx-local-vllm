@@ -6,7 +6,6 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
-const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -70,12 +69,10 @@ pub const VisionAgentToolRuntime = struct {
     execution_count: usize = 0,
     result_count: usize = 0,
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
 
     pub fn deinit(self: *VisionAgentToolRuntime) void {
         self.worker.deinit(self.alloc);
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
     }
 
@@ -127,7 +124,6 @@ pub const VisionAgentToolRuntime = struct {
             .permission_grants = &.{},
             .permission_rules = .{},
             .worker = &self.worker,
-            .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
             .context_limits = .{ .image_adapter_output_bytes = .{
@@ -142,8 +138,6 @@ pub const VisionAgentToolRuntime = struct {
             },
             .output_chunk_ctx = undefined,
             .on_output_chunk = discardVisionToolOutput,
-            .background_url_ctx = undefined,
-            .on_background_url_ready = discardVisionBackgroundUrl,
         };
     }
 };
@@ -155,30 +149,19 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-fn discardVisionBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
-
 const test_tools = [_]tool_dispatch.Tool{
-    builtin_tools.list_files,
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
     builtin_tools.write_file,
     builtin_tools.edit_file,
-    builtin_tools.delete_file,
-    builtin_tools.rename_file,
-    builtin_tools.copy_file,
-    builtin_tools.create_folder,
-    builtin_tools.file_info,
-    builtin_tools.memory,
-    builtin_tools.semantic_search,
-    builtin_tools.open_file,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
-    builtin_tools.terminal,
+    builtin_tools.shell,
+    builtin_tools.capability_search,
     builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_search_tools,
     builtin_tools.mcp_select_tool,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
@@ -186,15 +169,14 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
-    if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
-    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+    if (!std.mem.eql(u8, call.name, "shell")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"run\"") == null) {
         return .ordinary;
     }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .background = false,
             .target_os = builtin.os.tag,
         },
         .source = .interactive_once,
@@ -472,9 +454,11 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    if (review_turn.current_root_request.len > 0) {
-        try captured.appendSlice(alloc, review_turn.current_root_request);
-        try captured.append(alloc, '\n');
+    if (review_turn.trusted_root_context.len > 0) {
+        try captured.appendSlice(alloc, review_turn.trusted_root_context);
+        if (!std.mem.endsWith(u8, review_turn.trusted_root_context, "\n")) {
+            try captured.append(alloc, '\n');
+        }
     }
     return captured.toOwnedSlice(alloc);
 }
@@ -488,6 +472,8 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    validation_mcp_runtime_generation: ?u64 = null,
+    validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -512,6 +498,7 @@ pub const FakeAgentRuntimeDeps = struct {
     validated_names: std.ArrayList([]u8) = .empty,
     availability_checked_names: std.ArrayList([]u8) = .empty,
     execution_classification_complete: std.ArrayList(bool) = .empty,
+    execution_mcp_runtime_generations: std.ArrayList(?u64) = .empty,
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
@@ -643,6 +630,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
+        .image_input_support = .non_native,
         .prompt_caching = true,
         .context_window = 1_000_000,
     },
@@ -697,6 +685,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.validated_names);
         freeStringList(self.alloc, &self.availability_checked_names);
         self.execution_classification_complete.deinit(self.alloc);
+        self.execution_mcp_runtime_generations.deinit(self.alloc);
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
@@ -983,7 +972,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
-        return .valid;
+        const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
+            if (std.mem.eql(u8, name, call.name))
+                self.validation_mcp_runtime_generation
+            else
+                null
+        else
+            null;
+        return .{ .valid = .{
+            .mcp_runtime_generation = mcp_runtime_generation,
+        } };
     }
 
     fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1054,7 +1052,7 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
         try self.permission_review_root_authority_counts.append(
             self.alloc,
-            @intFromBool(review_turn.current_root_request.len > 0),
+            @intFromBool(review_turn.trusted_root_context.len > 0),
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
@@ -1340,6 +1338,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.alloc,
                 request.classification_complete,
             );
+            try self.execution_mcp_runtime_generations.append(
+                self.alloc,
+                request.expected_mcp_runtime_generation,
+            );
             try self.execute_timeout_started_ms.append(
                 self.alloc,
                 request.command_timeout_started_ms,
@@ -1461,7 +1463,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 u8,
                 result.model_output,
             );
-            if (result.prepared_result_memory) |*memory| {
+            if (result.tool_result_memory) |*memory| {
                 if (memory.output_handle) |handle| {
                     memory.output_handle = try request.result_allocator.dupe(
                         u8,
@@ -1520,11 +1522,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.history_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                 try self.record("history:assistant", .{});
             },
-            .background_command => |entry| {
-                if (self.background_history_log_path) |value| self.alloc.free(value);
-                self.background_history_log_path = try self.alloc.dupe(u8, entry.log_path);
-                try self.record("history:background", .{});
-            },
             .interrupted => |entry| {
                 self.interrupted_history_count += 1;
                 if (entry.tool_call) |tool_call| {
@@ -1565,10 +1562,6 @@ pub const FakeAgentRuntimeDeps = struct {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
-                    },
-                    .background_command => |entry| {
-                        if (self.background_event_log_path) |value| self.alloc.free(value);
-                        self.background_event_log_path = try self.alloc.dupe(u8, entry.log_path);
                     },
                     .interrupted => self.interrupted_event_count += 1,
                     .compacted_summary => {},

@@ -311,30 +311,6 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeExecutionMemory(writer, entry.execution);
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            const extended = entry.assistant != null or !entry.execution.isEmpty();
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurn(writer, entry.user);
-            try writer.writeAll(",\"log_path\":");
-            try writeDurableBytes(writer, entry.log_path);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{
-                if (entry.expect_url) "true" else "false",
-            });
-            try writeOptionalDurableBytes(writer, entry.url);
-            try writer.writeAll(",\"background_record_id\":");
-            if (entry.background_record_id) |record_id| {
-                try writeHexString(writer, &record_id);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (extended) {
-                try writer.writeAll(",\"assistant\":");
-                try writeOptionalDurableBytes(writer, entry.assistant);
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeUserTurn(writer, entry.user);
@@ -354,7 +330,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte(']');
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
-            if (!entry.execution.isEmpty()) {
+            if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemory(writer, entry.execution);
             }
@@ -365,6 +341,29 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
     }
+}
+
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeAll("]");
+    return out.toOwnedSlice();
 }
 
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
@@ -444,29 +443,32 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = if (shape.extended)
+        const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        errdefer if (assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| alloc.free(owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        errdefer if (url) |owned| alloc.free(owned);
-        const background_record_id = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
-        return .{ .background_command = .{
+        defer if (url) |owned| alloc.free(owned);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = background_record_id,
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
@@ -555,6 +557,13 @@ fn validateStateWithPermissionMigration(
     for (state.history) |turn| {
         if (session.historyTurnWorkId(turn)) |id| {
             session.validateWorkId(id) catch return error.InvalidDurableField;
+        }
+        if (types.historyTurnSummary(turn)) |summary| {
+            if (summary.started_at_ms < 0 or
+                summary.completed_at_ms < summary.started_at_ms)
+            {
+                return error.InvalidDurableField;
+            }
         }
     }
     if (state.usage) |usage| try session_usage.validateSnapshot(usage);
@@ -1096,7 +1105,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":4,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1118,7 +1127,33 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidence(writer, file);
     }
-    try writer.writeAll("]}");
+    try writer.writeAll("],\"turn_summary\":");
+    if (execution.turn_summary) |summary| {
+        try writeTurnSummary(writer, summary);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
+    return !execution.isEmpty() or execution.turn_summary != null;
+}
+
+fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
+    try writer.print(
+        "{{\"started_at_ms\":{d},\"completed_at_ms\":{d},\"thinking_duration_ms\":{d},\"turn_duration_ms\":{d},\"token_progress\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"input_exact\":{s},\"output_exact\":{s}}}}}",
+        .{
+            summary.started_at_ms,
+            summary.completed_at_ms,
+            summary.thinking_duration_ms,
+            summary.turn_duration_ms,
+            summary.token_progress.input_tokens,
+            summary.token_progress.output_tokens,
+            if (summary.token_progress.input_exact) "true" else "false",
+            if (summary.token_progress.output_exact) "true" else "false",
+        },
+    );
 }
 
 fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
@@ -1442,9 +1477,16 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
 }
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
-    const object = try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
+    const source = try requireObject(value);
+    const has_turn_summary = source.get("turn_summary") != null;
+    const object = if (has_turn_summary)
+        try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" })
+    else
+        try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
     const schema_version = try requireU64(object, "schema_version");
-    if (schema_version != 1 and schema_version != 2 and schema_version != 3 and schema_version != 4) {
+    if (schema_version < 1 or schema_version > 5 or
+        (schema_version == 5) != has_turn_summary)
+    {
         return error.InvalidSessionFormat;
     }
     const tool_steps = try parseToolSteps(
@@ -1454,7 +1496,48 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
-    return .{ .tool_steps = tool_steps, .files = files };
+    const turn_summary = if (has_turn_summary)
+        try parseOptionalTurnSummary(object.get("turn_summary").?)
+    else
+        null;
+    return .{
+        .tool_steps = tool_steps,
+        .files = files,
+        .turn_summary = turn_summary,
+    };
+}
+
+fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{
+        "started_at_ms",
+        "completed_at_ms",
+        "thinking_duration_ms",
+        "turn_duration_ms",
+        "token_progress",
+    });
+    const token_progress = try exactObject(
+        object.get("token_progress") orelse return error.InvalidSessionFormat,
+        &.{ "input_tokens", "output_tokens", "input_exact", "output_exact" },
+    );
+    const summary = types.TurnSummary{
+        .started_at_ms = try requireI64(object, "started_at_ms"),
+        .completed_at_ms = try requireI64(object, "completed_at_ms"),
+        .thinking_duration_ms = try requireU64(object, "thinking_duration_ms"),
+        .turn_duration_ms = try requireU64(object, "turn_duration_ms"),
+        .token_progress = .{
+            .input_tokens = try requireU64(token_progress, "input_tokens"),
+            .output_tokens = try requireU64(token_progress, "output_tokens"),
+            .input_exact = try requireBool(token_progress, "input_exact"),
+            .output_exact = try requireBool(token_progress, "output_exact"),
+        },
+    };
+    if (summary.started_at_ms < 0 or
+        summary.completed_at_ms < summary.started_at_ms)
+    {
+        return error.InvalidSessionFormat;
+    }
+    return summary;
 }
 
 fn parseToolSteps(
@@ -1670,7 +1753,7 @@ fn parseToolResult(
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5 => .{ .object = try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2061,7 +2144,7 @@ noinline fn parseOptionalDurableBytes(alloc: Allocator, value: std.json.Value) !
     };
 }
 
-fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecordId {
+fn parseOptionalIdentifier(value: std.json.Value) !?[16]u8 {
     return switch (value) {
         .null => null,
         .string => |hex| try parseHexIdentifier(hex),
@@ -2069,9 +2152,9 @@ fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecord
     };
 }
 
-fn parseHexIdentifier(hex: []const u8) !types.StableBackgroundRecordId {
+fn parseHexIdentifier(hex: []const u8) ![16]u8 {
     if (hex.len != 32) return error.InvalidSessionFormat;
-    var result: types.StableBackgroundRecordId = undefined;
+    var result: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&result, hex) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionFormat;
@@ -2404,11 +2487,6 @@ test "durable state round trips live history while discarding legacy authority" 
     const invalid_b = [_]u8{ 0xfe, 'b', 0x00 };
     const invalid_c = [_]u8{ 'c', 0xf8 };
     const exact_arguments = " \n{\"number\":1e+02}\t";
-    const record_id: types.StableBackgroundRecordId = .{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-
     var images = [_]session.ImageAttachment{.{
         .id = 7,
         .path = @constCast(invalid_a[0..]),
@@ -2467,7 +2545,7 @@ test "durable state round trips live history while discarding legacy authority" 
                 .files = files[0..],
             },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{
                 .text = @constCast(invalid_b[0..]),
                 .work_id = @constCast("work-background"),
@@ -2477,10 +2555,6 @@ test "durable state round trips live history while discarding legacy authority" 
                 .tool_steps = tool_steps[0..],
                 .files = files[0..],
             },
-            .log_path = @constCast(invalid_c[0..]),
-            .expect_url = true,
-            .url = @constCast(invalid_a[0..]),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{
@@ -2588,7 +2662,7 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
             .user = .{ .text = @constCast("continue") },
             .tool_call = .{
                 .id = "call_interrupted",
-                .name = "list_files",
+                .name = "glob_files",
                 .arguments_json = duplicate_arguments,
             },
         } },
@@ -2656,7 +2730,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
     var mismatched_call = [_]session.ToolCall{
         .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
     };
-    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "list_files")};
+    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "glob_files")};
     try expectMalformedPairRejected(mismatched_call[0..], mismatched_result[0..]);
 }
 
@@ -2849,13 +2923,22 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const turn: session.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
-        .execution = .{ .tool_steps = steps[0..] },
+        .execution = .{
+            .tool_steps = steps[0..],
+            .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .thinking_duration_ms = 40,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            },
+        },
     } };
 
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":4") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":5") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2866,6 +2949,10 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(
+        turn.assistant.execution.turn_summary,
+        decoded.assistant.execution.turn_summary,
+    );
     try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
     try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
     const presentation = decoded_result.committed_file_presentation orelse return error.TestExpectedPresentation;
@@ -2912,6 +2999,34 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+}
+
+test "private codec preserves summary-only interrupted turns" {
+    const alloc = std.testing.allocator;
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+
+    const turns = [_]session.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect repository") },
+        .execution = .{ .turn_summary = summary },
+    } }};
+
+    for (turns) |turn| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        try std.testing.expectEqual(summary, types.historyTurnSummary(decoded).?);
+    }
 }
 
 test "command process presentation codec preserves every terminal cause" {
@@ -3144,12 +3259,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         defer session.freeHistoryTurn(alloc, turn);
         switch (case.expected) {
             .background_legacy => {
-                try std.testing.expect(turn.background_command.assistant == null);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .background_extended => {
-                try std.testing.expectEqualStrings("candidate", turn.background_command.assistant.?);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "candidate") != null);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .interrupted_legacy => try std.testing.expect(turn.interrupted.execution.isEmpty()),
             .interrupted_extended => {
@@ -3170,28 +3288,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
     }
 
-    const legacy_background = session.HistoryTurn{ .background_command = .{
+    const migrated = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command"),
     } };
     var legacy_encoded: std.Io.Writer.Allocating = .init(alloc);
     defer legacy_encoded.deinit();
-    try writeHistoryTurn(&legacy_encoded.writer, legacy_background);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"assistant\"") == null);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"execution\"") == null);
-
-    const extended_background = session.HistoryTurn{ .background_command = .{
-        .user = .{ .text = @constCast("run") },
-        .assistant = @constCast("candidate"),
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
-    } };
-    var extended_encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer extended_encoded.deinit();
-    try writeHistoryTurn(&extended_encoded.writer, extended_background);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"execution\"") != null);
+    try writeHistoryTurn(&legacy_encoded.writer, migrated);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"kind\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "background_command") == null);
 }
 
 test "interrupted command presentation is strict and round trips" {
@@ -3349,19 +3454,6 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try std.testing.expectEqualSlices(u8, entry.assistant, got.assistant);
             try expectExecutionMemoryEqual(entry.execution, got.execution);
         },
-        .background_command => |entry| {
-            const got = actual.background_command;
-            try expectUserTurnEqual(entry.user, got.user);
-            try expectOptionalBytesEqual(entry.assistant, got.assistant);
-            try expectExecutionMemoryEqual(entry.execution, got.execution);
-            try std.testing.expectEqualSlices(u8, entry.log_path, got.log_path);
-            try std.testing.expectEqual(entry.expect_url, got.expect_url);
-            try expectOptionalBytesEqual(entry.url, got.url);
-            try std.testing.expectEqual(entry.background_record_id != null, got.background_record_id != null);
-            if (entry.background_record_id) |record_id| {
-                try std.testing.expectEqualSlices(u8, &record_id, &got.background_record_id.?);
-            }
-        },
         .interrupted => |entry| {
             const got = actual.interrupted;
             try expectUserTurnEqual(entry.user, got.user);
@@ -3380,6 +3472,7 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
 }
 
 fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
+    try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {
         try expectOptionalBytesEqual(step.assistant, got_step.assistant);

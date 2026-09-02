@@ -79,8 +79,33 @@ pub fn Runtime(comptime App: type) type {
                     try transitionScreen(app, .toggle);
                     return true;
                 },
+                .close => {
+                    if (childPresentationShell(app)) |child| {
+                        if (child.cancelPendingFullTranscriptOpen()) return true;
+                    }
+                    if (comptime @hasDecl(
+                        @TypeOf(app.shell),
+                        "cancelPendingFullTranscriptOpen",
+                    )) {
+                        if (app.shell.cancelPendingFullTranscriptOpen()) return true;
+                    }
+                    return false;
+                },
                 else => false,
             };
+        }
+
+        pub fn cancelPendingOpenForInput(app: *App) bool {
+            if (childPresentationShell(app)) |child| {
+                if (child.cancelPendingFullTranscriptOpen()) return true;
+            }
+            if (comptime @hasDecl(
+                @TypeOf(app.shell),
+                "cancelPendingFullTranscriptOpen",
+            )) {
+                return app.shell.cancelPendingFullTranscriptOpen();
+            }
+            return false;
         }
 
         fn transitionScreen(
@@ -91,6 +116,10 @@ pub fn Runtime(comptime App: type) type {
                 const from = childPresentationDepth(app);
                 const to = from.transition(event);
                 if (from == to) return;
+                if (from == .inline_mode and to == .full) {
+                    const child = childPresentationShell(app) orelse return;
+                    if (!child.requestFullTranscriptOpen()) return;
+                }
                 if (comptime @hasDecl(
                     @TypeOf(app.subagents),
                     "setChildTranscriptPresentationDepth",
@@ -115,9 +144,15 @@ pub fn Runtime(comptime App: type) type {
             const to = from.transition(event);
             if (from == to) return;
             if (from == .inline_mode) {
-                std.debug.assert(to == .review);
+                std.debug.assert(to == .full);
                 if (app.terminal.alternate_screen_owner != .none) return;
                 if (app.approval_prompt.isActive()) return;
+                if (comptime @hasDecl(
+                    @TypeOf(app.shell),
+                    "requestFullTranscriptOpen",
+                )) {
+                    if (!app.shell.requestFullTranscriptOpen()) return;
+                }
                 try app_lifecycle.openFullTranscript(
                     app.alloc,
                     &app.terminal,
@@ -125,21 +160,14 @@ pub fn Runtime(comptime App: type) type {
                     &app.metrics,
                 );
                 requestActiveSurfaceFrame(app);
-            } else if (to == .inline_mode) {
+            } else {
+                std.debug.assert(to == .inline_mode);
                 try app_lifecycle.closeFullTranscript(
                     app.alloc,
                     &app.terminal,
                     &app.shell,
                     &app.metrics,
                 );
-            } else {
-                const changed = try app.shell.setTranscriptPresentationDepth(app.alloc, to);
-                debug_trace.logf(
-                    "full_transcript",
-                    "depth_set to={s} changed={} depth_after_set={s}",
-                    .{ depthName(to), changed, depthName(app.shell.transcriptPresentationDepth()) },
-                );
-                requestActiveSurfaceFrame(app);
             }
             logDepthTransition(
                 from,
@@ -195,6 +223,8 @@ pub fn Runtime(comptime App: type) type {
                 .toggle_full_transcript => .toggle,
                 .cursor_left => .{ .navigate = .left },
                 .cursor_right => .{ .navigate = .right },
+                .cursor_up => .{ .wheel_scroll = .up },
+                .cursor_down => .{ .wheel_scroll = .down },
                 .escape => .close,
                 .mouse_wheel => |direction| .{ .wheel_scroll = direction },
                 .page_up => .{ .page_scroll = .up },
@@ -343,7 +373,6 @@ pub fn Runtime(comptime App: type) type {
         fn depthName(depth: transcript_presentation.Depth) []const u8 {
             return switch (depth) {
                 .inline_mode => "inline",
-                .review => "review",
                 .full => "full",
             };
         }
@@ -351,7 +380,7 @@ pub fn Runtime(comptime App: type) type {
 }
 
 const ApprovalRoutingSubagents = struct {
-    depth: transcript_presentation.Depth = .review,
+    depth: transcript_presentation.Depth = .full,
     selected_child_id: []const u8 = "child-one",
     approval_child_id: []const u8 = "child-one",
 
@@ -433,7 +462,7 @@ test "full transcript owns raw semantic and remapped ctrl-l" {
         .remapped_byte = 12,
     }));
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
         app.subagents.depth,
     );
 }
@@ -444,7 +473,7 @@ test "selected child approval owns ctrl-o ahead of transcript depth" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 77,
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     _ = try Runtime(ApprovalRoutingApp).routeAction(
@@ -453,7 +482,7 @@ test "selected child approval owns ctrl-o ahead of transcript depth" {
     );
 
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
         app.subagents.depth,
     );
     try std.testing.expect(app.approval_prompt.isActive());
@@ -466,7 +495,7 @@ test "approval for another child does not steal selected child transcript input"
     app.subagents.approval_child_id = "child-two";
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 77,
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try std.testing.expect(!Runtime(ApprovalRoutingApp).approvalOwnsCurrentSurface(&app));

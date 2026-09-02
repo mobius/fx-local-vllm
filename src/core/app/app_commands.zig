@@ -5,7 +5,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_commands = @import("../background/background_commands.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -32,8 +31,10 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
+const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -355,10 +356,6 @@ pub fn Handlers(comptime App: type) type {
                 .logout = commandLogout,
                 .setup = commandSetup,
                 .show_status = commandShowStatus,
-                .show_background = commandShowBackground,
-                .stop_background = commandStopBackground,
-                .open_background = commandOpenBackground,
-                .show_background_logs = commandShowBackgroundLogs,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
@@ -391,6 +388,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpReloadCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuReloadCompletion"))
+            {
+                switch (app.mcpReloadCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuReloadCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
             var warning = false;
             const body = switch (completion) {
                 .outcome => |outcome| switch (outcome) {
@@ -436,6 +444,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
@@ -453,12 +472,26 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                try app.presentProjectMcpPrompt();
+            }
         }
 
         pub fn collectMcpAuthenticationFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
             var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpAuthenticationCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
+            {
+                switch (app.mcpAuthenticationCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
 
             if (completion.result) |authentication| {
                 switch (authentication) {
@@ -695,26 +728,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).showStatus(app);
-        }
-
-        fn commandShowBackground(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).show(app);
-        }
-
-        fn commandStopBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).stop(app, target);
-        }
-
-        fn commandOpenBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).open(app, target);
-        }
-
-        fn commandShowBackgroundLogs(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).logs(app, target);
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -1005,6 +1018,10 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "usage_dashboard")) {
+                try openUsageDashboard(app, .days_30);
+                return;
+            }
             var usage = loadUsageSnapshot(app, .days_30) catch |err| {
                 debug_trace.logf(
                     "usage",
@@ -1028,26 +1045,142 @@ pub fn Handlers(comptime App: type) type {
             app: *App,
             scope: usage_report.Scope,
         ) !void {
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard refresh failed scope={s} reason={s}",
-                    .{ @tagName(scope), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.recordRefreshFailure(
-                    app.alloc,
-                    scope,
-                    "Local usage data is unavailable",
-                );
+            if (comptime @hasField(App, "usage_dashboard")) {
+                if (scope == .session) {
+                    var usage = loadUsageSnapshot(app, scope) catch |err| {
+                        try recordUsageRefreshFailure(app, scope, err);
+                        return;
+                    };
+                    errdefer usage.deinit(app.alloc);
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
+                try requestUsageDashboardRefresh(app);
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            var usage = loadUsageSnapshot(app, scope) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
                 return;
             };
             errdefer usage.deinit(app.alloc);
+            installUsageSnapshot(app, usage);
+        }
+
+        pub fn reloadUsageMenu(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            if (scope == .session) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            app.input_runtime.usage_menu.requested_scope = scope;
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn collectUsageDashboardFacts(app: *App) !bool {
+            if (comptime !@hasField(App, "usage_dashboard")) return false;
+            const transition = app.usage_dashboard.pollTransition();
+            if (transition == .none) return false;
+            if (!app.input_runtime.usage_menu.active or
+                app.input_runtime.usage_menu.navigationScope() == .session)
+            {
+                return false;
+            }
+            const scope = app.input_runtime.usage_menu.navigationScope();
+            if (transition == .failed) {
+                const err = app.usage_dashboard.lastError() orelse
+                    error.ProfileUsageUnavailable;
+                try recordUsageRefreshFailure(app, scope, err);
+                return true;
+            }
+            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                installUsageSnapshot(app, usage);
+                return true;
+            }
+            const err = app.usage_dashboard.lastError() orelse
+                error.ProfileUsageUnavailable;
+            try recordUsageRefreshFailure(app, scope, err);
+            return true;
+        }
+
+        fn openUsageDashboard(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
+            if (cached) |usage| {
+                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+            } else {
+                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+            }
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn requestUsageDashboardRefresh(app: *App) !void {
+            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const availability = try app.session.ensureProfileUsageReadable(
+                app.alloc,
+                home,
+            );
+            if (availability == .unavailable) {
+                return app.session.profile_usage.lastError() orelse
+                    error.ProfileUsageUnavailable;
+            }
+            _ = try app.usage_dashboard.requestRefresh(
+                usage_dashboard_runtime.profileProvider(
+                    &app.session.profile_usage,
+                ),
+                home,
+                @max(io_mod.milliTimestamp(), 0),
+            );
+        }
+
+        fn installUsageSnapshot(
+            app: *App,
+            usage: usage_report.Snapshot,
+        ) void {
             if (app.input_runtime.usage_menu.active) {
                 app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
             } else {
                 app.input_runtime.usage_menu.openOwned(app.alloc, usage);
             }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn recordUsageRefreshFailure(
+            app: *App,
+            scope: usage_report.Scope,
+            err: anyerror,
+        ) !void {
+            debug_trace.logf(
+                "usage",
+                "usage dashboard refresh failed scope={s} reason={s}",
+                .{ @tagName(scope), @errorName(err) },
+            );
+            try app.input_runtime.usage_menu.recordRefreshFailure(
+                app.alloc,
+                scope,
+                "Local usage data is unavailable",
+            );
             app.shell.render_requests.request(.footer);
         }
 
@@ -1139,6 +1272,25 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0 and
+                comptime @hasDecl(App, "openMcpMenu"))
+            {
+                closeModelMenuIfPresent(app);
+                closeHelpMenuIfPresent(app);
+                closeInlineCommandMenusIfPresent(app);
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                        app.input_runtime.settings_menu.close();
+                    }
+                }
+                if (comptime @hasField(App, "session_persistence")) {
+                    app.session_persistence.session_picker.active = false;
+                }
+                try app.openMcpMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
@@ -1165,6 +1317,10 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                try applyProjectMcpAction(app, action, command_body);
+                return;
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
@@ -1200,6 +1356,70 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn applyProjectMcpAction(
+            app: *App,
+            action: @import("../mcp/project_config.zig").ProjectMcpAction,
+            success_body: []const u8,
+        ) !void {
+            if (comptime !@hasField(App, "workspace_root") or
+                !@hasDecl(App, "beginMcpAuthorityReduction"))
+            {
+                return error.McpProjectChoicesUnavailable;
+            } else {
+                const reducing_requested = switch (action) {
+                    .reject, .reset => true,
+                    .approve, .approve_all => false,
+                };
+                var attempt = config_runtime.attemptProjectMcpMutation(
+                    app.alloc,
+                    app.workspace_root,
+                    action,
+                );
+                defer attempt.deinit(app.alloc);
+                var warning = false;
+                var owned_notice: ?[]u8 = null;
+                defer if (owned_notice) |notice| app.alloc.free(notice);
+                switch (attempt) {
+                    .outcome => |outcome| switch (outcome) {
+                        .unchanged => {},
+                        .committed => |committed| {
+                            if (committed.authority_reduced) {
+                                try app.beginMcpAuthorityReduction(true);
+                            } else {
+                                try app.beginMcpReload();
+                            }
+                        },
+                    },
+                    .failure => |failure| {
+                        warning = true;
+                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                            try app.beginMcpAuthorityReduction(false);
+                            owned_notice = try app.alloc.dupe(
+                                u8,
+                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                            );
+                        } else {
+                            owned_notice = try std.fmt.allocPrint(
+                                app.alloc,
+                                "Project MCP choices were not applied: {s}.",
+                                .{@errorName(failure.err)},
+                            );
+                        }
+                    },
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (warning) .warning else .neutral,
+                    .body = owned_notice orelse success_body,
+                }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
+            }
         }
 
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
@@ -1460,6 +1680,7 @@ pub fn Handlers(comptime App: type) type {
                 .removed = result.removed,
                 .revocation_failed = result.revocation_failed,
                 .repaired_entries = result.repaired_entries,
+                .local_only = result.local_only,
             };
         }
 
@@ -1476,7 +1697,64 @@ pub fn Handlers(comptime App: type) type {
             const provider = app.skillsCommandProvider();
             const command = provider.parseCommand(rest);
 
-            try app.reloadSkills();
+            if (comptime @hasDecl(App, "requestSkillsRefresh")) switch (command) {
+                .list => {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(app.alloc, generation, .list);
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .show => |name| {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(
+                        app.alloc,
+                        generation,
+                        .{ .show = name },
+                    );
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .install, .create, .remove, .path, .usage => {},
+            };
+            try executeSkillsCommand(app, provider, command);
+            try collectSkillsRefreshFacts(app);
+        }
+
+        pub fn collectSkillsRefreshFacts(app: *App) !void {
+            var ready = app.skills.takeReadyRefreshAction() orelse return;
+            defer ready.deinit(app.alloc);
+            if (!ready.succeeded) {
+                try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .@"error",
+                    .body = "Skills could not be refreshed. The previous catalog was not shown as current.",
+                }, true);
+                return;
+            }
+            switch (ready.action) {
+                .list => try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .list,
+                ),
+                .show => |name| try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .{ .show = name },
+                ),
+                .notice => |body| try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .neutral,
+                    .body = body,
+                }, true),
+            }
+        }
+
+        fn executeSkillsCommand(
+            app: *App,
+            provider: skill_commands.Provider,
+            command: skill_commands.Command,
+        ) !void {
             try writeSkillDiagnosticNotice(app);
 
             switch (command) {
@@ -1567,12 +1845,15 @@ pub fn Handlers(comptime App: type) type {
                     }
                 },
                 .notice => |notice| {
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = notice.text,
-                    }, true);
-                    if (notice.reload) try app.reloadSkills();
+                    if (notice.reload and comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(app, notice.text);
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = notice.text,
+                        }, true);
+                    }
                 },
                 .installed => |install_result| {
                     var installed_notice: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1584,14 +1865,29 @@ pub fn Handlers(comptime App: type) type {
 
                     const msg = try installed_notice.toOwnedSlice();
                     defer app.alloc.free(msg);
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = std.mem.trimEnd(u8, msg, "\n"),
-                    }, true);
-                    try app.reloadSkills();
+                    if (comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(
+                            app,
+                            std.mem.trimEnd(u8, msg, "\n"),
+                        );
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = std.mem.trimEnd(u8, msg, "\n"),
+                        }, true);
+                    }
                 },
             }
+        }
+
+        fn queueSkillsNoticeAfterRefresh(app: *App, body: []const u8) !void {
+            const generation = try app.requestSkillsRefresh();
+            try app.skills.queueRefreshAction(
+                app.alloc,
+                generation,
+                .{ .notice = body },
+            );
         }
 
         fn closeModelMenuIfPresent(app: *App) void {
@@ -1897,7 +2193,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
-    try writeToolCallsSummary(&out.writer, app.alloc);
+    try writeToolCallsSummary(&out.writer, app.alloc, app.session.history.items);
     try writeSubagentsSummary(&out.writer, app.alloc, &app.subagents);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
@@ -1934,6 +2230,45 @@ noinline fn writeMaskedInline(writer: *std.Io.Writer, alloc: std.mem.Allocator, 
     try writer.writeAll(masked);
 }
 
+fn traceToolDisplayName(tool_name: []const u8) []const u8 {
+    return if (tool_presentation.isProviderSearchAlias(tool_name))
+        "web_search"
+    else
+        tool_name;
+}
+
+fn isTraceToolTokenByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn providerSearchAliasPrefixLen(token: []const u8) ?usize {
+    var end: usize = 1;
+    while (end <= token.len) : (end += 1) {
+        if (!tool_presentation.isProviderSearchAlias(token[0..end])) continue;
+        if (end == token.len or token[end] == '_') return end;
+    }
+    return null;
+}
+
+fn writeTraceTextNeutralized(writer: *std.Io.Writer, text: []const u8) !void {
+    var token_start: usize = 0;
+    var scan_index: usize = 0;
+    var written_through: usize = 0;
+    while (scan_index < text.len) {
+        if (!isTraceToolTokenByte(text[scan_index])) {
+            scan_index += 1;
+            continue;
+        }
+        token_start = scan_index;
+        while (scan_index < text.len and isTraceToolTokenByte(text[scan_index])) : (scan_index += 1) {}
+        const alias_len = providerSearchAliasPrefixLen(text[token_start..scan_index]) orelse continue;
+        try writer.writeAll(text[written_through..token_start]);
+        try writer.writeAll("web_search");
+        written_through = token_start + alias_len;
+    }
+    try writer.writeAll(text[written_through..]);
+}
+
 fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
     try writer.writeAll("\n## Current State\n");
@@ -1957,7 +2292,13 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
+        var usage = try app.session.usage.snapshot(alloc);
+        defer usage.deinit(alloc);
+        try writeSearchUsageSummary(
+            writer,
+            app.total_web_search_requests,
+            usage.billable_web_search_calls,
+        );
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -2136,7 +2477,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     if (lastInterruptedTurn(app.session.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
-        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{call.name});
+        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
         if (entry.completed_tool_names.len > 0) try writer.print(" completed_tools={d}", .{entry.completed_tool_names.len});
         try writer.writeByte('\n');
     }
@@ -2213,29 +2554,6 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
     try writer.print("TERM_PROGRAM: {s}\n", .{io_mod.getenv("TERM_PROGRAM") orelse "(unset)"});
     try writer.print("LANG: {s}\n", .{io_mod.getenv("LANG") orelse "(unset)"});
-
-    const tasks = app.background.snapshotTasks(alloc) catch null;
-    if (tasks) |snapshot| {
-        defer snapshot.deinit(alloc);
-        if (snapshot.items.len == 0) {
-            try writer.writeAll("background_tasks: none\n");
-        } else {
-            try writer.print("background_tasks ({d}):\n", .{snapshot.items.len});
-            for (snapshot.items) |task| {
-                try writer.print("  - id={d} state={s} pid={s} cwd=", .{ task.id, @tagName(task.state), task.pid });
-                try writeMaskedInline(writer, alloc, task.cwd);
-                try writer.writeAll(" command=");
-                try writeMaskedInline(writer, alloc, task.command);
-                try writer.writeAll(" log=");
-                try writeMaskedInline(writer, alloc, task.log_path);
-                if (task.server_url) |url| {
-                    try writer.writeAll(" url=");
-                    try writeMaskedInline(writer, alloc, url);
-                }
-                try writer.writeByte('\n');
-            }
-        }
-    }
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
@@ -2405,7 +2723,7 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
     }
     try writer.print("\n## Permissions\npermission grants ({d}):\n", .{grants.len});
     for (grants) |grant| {
-        try writer.print("  - {s} :: {s}\n", .{ grant.tool_name, grant.target_path });
+        try writer.print("  - {s} :: {s}\n", .{ traceToolDisplayName(grant.tool_name), grant.target_path });
     }
 }
 
@@ -2431,45 +2749,139 @@ fn writeSubagentsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, contr
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
-    try writer.print(" name={s} status={s} duration={d}ms", .{ call.name(), if (call.ok) "ok" else "err", call.duration_ms });
+    try writer.print(" name={s} status={s} duration={d}ms", .{ traceToolDisplayName(call.name()), if (call.ok) "ok" else "err", call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     try writer.writeByte('\n');
 }
 
-noinline fn writeToolCallsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+const ProviderToolCallSummary = struct {
+    call_id: []const u8,
+    status: ?types.PersistedToolStatus,
+};
+
+fn findPersistedToolResult(
+    execution: types.ExecutionMemory,
+    call_id: []const u8,
+) ?types.PersistedToolResult {
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+        }
+    }
+    return null;
+}
+
+fn projectProviderToolCalls(
+    history: []const types.HistoryTurn,
+    output: []ProviderToolCallSummary,
+) usize {
+    if (output.len == 0) return 0;
+
+    var count: usize = 0;
+    for (history) |turn| {
+        const execution: types.ExecutionMemory = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        for (execution.tool_steps) |step| {
+            for (step.tool_calls) |call| {
+                if (call.provenance != .provider_executed or
+                    !tool_presentation.isProviderSearchAlias(call.name)) continue;
+                const summary: ProviderToolCallSummary = .{
+                    .call_id = call.id,
+                    .status = if (findPersistedToolResult(execution, call.id)) |result|
+                        result.status
+                    else
+                        null,
+                };
+                if (count < output.len) {
+                    output[count] = summary;
+                    count += 1;
+                } else {
+                    std.mem.copyForwards(
+                        ProviderToolCallSummary,
+                        output[0 .. output.len - 1],
+                        output[1..],
+                    );
+                    output[output.len - 1] = summary;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
+    return if (status) |value| switch (value) {
+        .success => "ok",
+        .failure => "err",
+    } else "pending";
+}
+
+fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
+    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
+    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
+}
+
+noinline fn writeToolCallsSummary(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    history: []const types.HistoryTurn,
+) !void {
     var buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
-    if (n == 0) {
+    var provider_buf: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+    const provider_n = projectProviderToolCalls(history, &provider_buf);
+    if (n == 0 and provider_n == 0) {
         try writer.writeAll("\n## Tool Calls\n(none recorded)\n");
         return;
     }
 
-    var ok_count: u32 = 0;
-    var error_count: u32 = 0;
-    var total_ms: u64 = 0;
-    for (buf[0..n]) |call| {
-        if (call.ok) ok_count += 1 else error_count += 1;
-        total_ms += call.duration_ms;
-    }
-
-    try writer.print("\n## Tool Calls\nlast={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
-    if (error_count > 0) {
-        try writer.writeAll("errors first:\n");
+    try writer.writeAll("\n## Tool Calls\n### Local\n");
+    if (n == 0) {
+        try writer.writeAll("(none locally executed)\n");
+    } else {
+        var ok_count: u32 = 0;
+        var error_count: u32 = 0;
+        var total_ms: u64 = 0;
         for (buf[0..n]) |call| {
-            if (call.ok) continue;
+            if (call.ok) ok_count += 1 else error_count += 1;
+            total_ms += call.duration_ms;
+        }
+
+        try writer.print("last={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
+        if (error_count > 0) {
+            try writer.writeAll("errors first:\n");
+            for (buf[0..n]) |call| {
+                if (call.ok) continue;
+                try writeToolCallCompact(writer, call);
+                try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
+                try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            }
+            try writer.writeAll("recent successes (compact):\n");
+        } else {
+            try writer.writeAll("recent successes (compact):\n");
+        }
+        for (buf[0..n]) |call| {
+            if (!call.ok) continue;
             try writeToolCallCompact(writer, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-            try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
         }
-        try writer.writeAll("recent successes (compact):\n");
-    } else {
-        try writer.writeAll("recent successes (compact):\n");
     }
-    for (buf[0..n]) |call| {
-        if (!call.ok) continue;
-        try writeToolCallCompact(writer, call);
-        try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-        try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
+
+    try writer.writeAll("### Web Search\n");
+    if (provider_n == 0) {
+        try writer.writeAll("(none retained)\n");
+        return;
+    }
+    try writer.print("last={d}\n", .{provider_n});
+    for (provider_buf[0..provider_n]) |call| {
+        try writer.print(
+            "name=web_search status={s}\n",
+            .{providerToolStatusLabel(call.status)},
+        );
     }
 }
 
@@ -2538,7 +2950,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
         .interrupted => |t| {
             try writer.writeAll("\n## Interrupted Turn\nlast turn was interrupted by user\n");
             if (t.tool_call) |call| {
-                try writer.print("  in_flight_tool: {s}\n", .{call.name});
+                try writer.print("  in_flight_tool: {s}\n", .{traceToolDisplayName(call.name)});
                 if (call.arguments_json.len > 0) {
                     try writer.writeAll("  in_flight_args:\n");
                     if (call.arguments_json.len > trace_tool_args_max_bytes) {
@@ -2554,7 +2966,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
             }
             if (t.completed_tool_names.len > 0) {
                 try writer.print("  completed_tools ({d}):", .{t.completed_tool_names.len});
-                for (t.completed_tool_names) |name| try writer.print(" {s}", .{name});
+                for (t.completed_tool_names) |name| try writer.print(" {s}", .{traceToolDisplayName(name)});
                 try writer.writeByte('\n');
             }
         },
@@ -2603,11 +3015,14 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
     for (lines.items[start..]) |line| {
         const masked = try text_utils.maskSecrets(alloc, line);
         defer if (masked.ptr != line.ptr) alloc.free(masked);
+        const visible = if (masked.len > trace_transcript_max_line_bytes)
+            masked[0..trace_transcript_max_line_bytes]
+        else
+            masked;
+        try writeTraceTextNeutralized(writer, visible);
         if (masked.len > trace_transcript_max_line_bytes) {
-            try writer.writeAll(masked[0..trace_transcript_max_line_bytes]);
             try writer.writeAll(" ...\n");
         } else {
-            try writer.writeAll(masked);
             try writer.writeByte('\n');
         }
     }
@@ -3230,6 +3645,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
+        snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3290,6 +3708,21 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             if (enabled != statuslineItemEnabled(app, item)) {
                 try applyStatuslineItem(app, item, enabled, .announce);
             }
+        },
+        .collapse_tool_calls => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.collapse_tool_calls;
+            if (runtime_changed) {
+                app.shell.collapse_tool_calls = enabled;
+                app.shell.markTranscriptStructureDirty();
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferences(
+                app,
+                "collapse tool calls",
+                .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3423,6 +3856,9 @@ const McpCommandFakeApp = struct {
     reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
     authentication_pending: bool = false,
+    completion_origin: app_mcp_runtime.PresentationOrigin = .command,
+    menu_reload_completions: usize = 0,
+    menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3514,6 +3950,19 @@ const McpCommandFakeApp = struct {
         };
     }
 
+    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuReloadCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_reload_completions += 1;
+    }
+
     fn takeMcpAuthenticationCompletion(
         self: *McpCommandFakeApp,
     ) !?app_mcp_runtime.AuthenticationCompletion {
@@ -3523,6 +3972,19 @@ const McpCommandFakeApp = struct {
             .server_name = try self.alloc.dupe(u8, "fixture"),
             .result = .{ .authenticated = .{} },
         };
+    }
+
+    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_authentication_completions += 1;
     }
 
     noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
@@ -3669,8 +4131,10 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn reloadSkills(self: *SkillsInstallReplayApp) !void {
+    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
         self.reload_count += 1;
+        self.skills.fresh_through_generation = self.reload_count;
+        return self.reload_count;
     }
 
     noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
@@ -3806,7 +4270,7 @@ test "trace tool calls print errors first and mask obvious secrets" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     const error_pos = std.mem.find(u8, text, "name=run_command") orelse return error.TestExpectedEqual;
@@ -3831,7 +4295,7 @@ test "trace successful tool calls use compact result previews" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "recent successes (compact):") != null);
@@ -3853,7 +4317,7 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "name=web_fetch") != null);
@@ -3863,6 +4327,143 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
     try std.testing.expect(std.mem.find(u8, text, "EXTRACTED_RESULT_SECRET") == null);
     try std.testing.expect(std.mem.find(u8, text, "args:") == null);
     try std.testing.expect(std.mem.find(u8, text, "result_preview:") == null);
+}
+
+test "trace web search calls hide provider names and payloads" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var calls = [_]types.ToolCall{
+        .{
+            .id = "call_exa",
+            .name = "exa_search",
+            .arguments_json = "{\"query\":\"PROVIDER_ARGUMENT_SECRET\"}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_parallel",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_pending",
+            .name = "perplexity_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_local",
+            .name = "read_file",
+            .arguments_json = "{}",
+            .provenance = .fx_local,
+        },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_parallel"),
+            .tool_name = @constCast("parallel_search"),
+            .status = .failure,
+            .output = @constCast("PROVIDER_RESULT_SECRET"),
+            .output_bytes = 22,
+            .stored_output_bytes = 22,
+            .provider_native = true,
+        },
+        .{
+            .tool_call_id = @constCast("call_exa"),
+            .tool_name = @constCast("exa_search"),
+            .status = .success,
+            .output = @constCast("{\"results\":[]}"),
+            .output_bytes = 14,
+            .stored_output_bytes = 14,
+            .provider_native = true,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &history);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=ok") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=err") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=pending") != null);
+    try std.testing.expect(std.mem.find(u8, text, "call_id=") == null);
+    try std.testing.expect(std.mem.find(u8, text, "exa_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "parallel_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "perplexity_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "name=read_file") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_ARGUMENT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_RESULT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "(none recorded)") == null);
+}
+
+test "trace text normalizes internal search aliases" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeTraceTextNeutralized(
+        &out.writer,
+        "name=exa_search call_id=exa_search_0 fallback=parallel_search legacy=perplexity_search visible=web_search",
+    );
+
+    try std.testing.expectEqualStrings(
+        "name=web_search call_id=web_search_0 fallback=web_search legacy=web_search visible=web_search",
+        out.written(),
+    );
+}
+
+test "trace provider tool projection keeps the most recent bounded calls" {
+    var calls: [diagnostics.tool_call_ring_capacity + 1]types.ToolCall = undefined;
+    for (&calls, 0..) |*call, index| {
+        call.* = .{
+            .id = if (index == 0)
+                "oldest"
+            else if (index + 1 == calls.len)
+                "newest"
+            else
+                "middle",
+            .name = "exa_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    var summaries: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+
+    const count = projectProviderToolCalls(&history, &summaries);
+
+    try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, count);
+    try std.testing.expectEqualStrings("middle", summaries[0].call_id);
+    try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
+}
+
+test "trace labels observed and billed search usage independently" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeSearchUsageSummary(&out.writer, 3, 1);
+
+    try std.testing.expectEqualStrings(
+        "web_search_requests_total: 3 (observed)\n" ++
+            "billable_web_search_calls: 1 (billed)\n",
+        out.written(),
+    );
 }
 
 test "trace renders web search request count without content" {
@@ -4021,6 +4622,28 @@ test "app_commands renders transactional status for explicit MCP reload" {
     ));
 }
 
+test "menu-origin MCP completions never publish transcript notices" {
+    var reload_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .reload_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer reload_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&reload_app);
+    try std.testing.expectEqual(@as(usize, 1), reload_app.menu_reload_completions);
+    try std.testing.expectEqual(@as(usize, 0), reload_app.notice_count);
+
+    var authentication_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .authentication_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer authentication_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&authentication_app);
+    try std.testing.expectEqual(@as(usize, 1), authentication_app.menu_authentication_completions);
+    try std.testing.expectEqual(@as(usize, 0), authentication_app.notice_count);
+}
+
 test "app_commands explains healthy and degraded MCP reloads without internal state" {
     const cases = [_]struct {
         behavior: McpCommandFakeApp.ReloadBehavior,
@@ -4144,7 +4767,7 @@ test "skills install groups command notice fragments for entry replay" {
 
     try std.testing.expectEqual(@as(usize, 2), app.shell.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.write_count);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
@@ -4343,7 +4966,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),

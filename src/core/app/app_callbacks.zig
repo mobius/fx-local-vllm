@@ -20,13 +20,13 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
 const parent_delivery_projector = @import("../subagent/parent_delivery_projector.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -284,6 +284,7 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
+                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
                 .prepare_parent_turn_context = agentPrepareParentTurnContext,
                 .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
                 .append_runtime_context = agentAppendRuntimeContext,
@@ -531,20 +532,6 @@ pub fn Bindings(comptime App: type) type {
             agentReportInnerToolUsage(ctx, tool_name, usage);
         }
 
-        pub fn onBackgroundUrlReady(ctx: *anyopaque, task_id: u64, url: []const u8) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundServerReadyNotice(std.heap.c_allocator, task_id, url, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
-        }
-
-        pub fn onTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundCompletionNotice(std.heap.c_allocator, completion, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
-        }
-
         fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.appendRuntimeContextMessage(arena, messages);
@@ -561,6 +548,19 @@ pub fn Bindings(comptime App: type) type {
                 .turn_id = turn_id,
                 .outcome = outcome,
             });
+        }
+
+        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            if (owned.len == 0) return &.{};
+            defer {
+                for (owned) |text| std.heap.c_allocator.free(text);
+                std.heap.c_allocator.free(owned);
+            }
+            const result = try arena.alloc([]const u8, owned.len);
+            for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
+            return result;
         }
 
         fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1008,7 +1008,8 @@ pub fn Bindings(comptime App: type) type {
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
-            if (!std.mem.eql(u8, tool_name, "web_search")) return;
+            if (!std.mem.eql(u8, tool_name, "web_search") and
+                !tool_presentation.isProviderSearchAlias(tool_name)) return;
             const app: *App = @ptrCast(@alignCast(ctx));
             app.total_web_search_requests +|= @as(u64, usage.web_search_requests);
         }
@@ -1253,7 +1254,6 @@ const FakePacer = struct {
     defer_history: bool = false,
     enqueue_count: usize = 0,
     flush_count: usize = 0,
-    flush_result: assistant_pacer.FlushResult = .drained,
 
     fn deinit(self: *FakePacer, alloc: std.mem.Allocator) void {
         self.text.deinit(alloc);
@@ -1270,18 +1270,6 @@ const FakePacer = struct {
         return self.defer_history;
     }
 
-    pub fn flushPendingText(self: *FakePacer, callbacks: anytype) !assistant_pacer.FlushResult {
-        _ = callbacks;
-        self.flush_count += 1;
-        if (self.flush_result == .drained) self.text.clearRetainingCapacity();
-        return self.flush_result;
-    }
-
-    pub fn flushPendingTextAtBoundary(self: *FakePacer, callbacks: anytype) !void {
-        _ = try self.flushPendingText(callbacks);
-        self.text.clearRetainingCapacity();
-    }
-
     pub fn flushPresentationAtBoundary(
         self: *FakePacer,
         alloc: std.mem.Allocator,
@@ -1290,7 +1278,9 @@ const FakePacer = struct {
     ) !void {
         _ = alloc;
         _ = now_ns;
-        try self.flushPendingTextAtBoundary(callbacks);
+        _ = callbacks;
+        self.flush_count += 1;
+        self.text.clearRetainingCapacity();
     }
 };
 
@@ -1912,15 +1902,25 @@ test "inner search tokens do not replace outer context counters" {
         .input_tokens = 100,
         .output_tokens = 20,
     });
-    (deps.report_inner_tool_usage orelse return error.TestExpectedEqual)(deps.ctx, "web_search", .{
-        .input_tokens = 999,
-        .output_tokens = 888,
-        .web_search_requests = 3,
-    });
+    const report = deps.report_inner_tool_usage orelse return error.TestExpectedEqual;
+    const search_names = [_][]const u8{
+        "web_search",
+        "exa_search",
+        "parallel_search",
+        "perplexity_search",
+    };
+    for (search_names) |name| {
+        report(deps.ctx, name, .{
+            .input_tokens = 999,
+            .output_tokens = 888,
+            .web_search_requests = 1,
+        });
+    }
+    report(deps.ctx, "provider_tool", .{ .web_search_requests = 7 });
 
     try std.testing.expectEqual(@as(u64, 100), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 20), app.total_output_tokens);
-    try std.testing.expectEqual(@as(u64, 3), app.total_web_search_requests);
+    try std.testing.expectEqual(@as(u64, 4), app.total_web_search_requests);
 }
 
 test "agent diff block callback enqueues worker event without direct transcript mutation" {
@@ -2098,39 +2098,6 @@ test "MCP progress callback publishes the owning tool lifecycle" {
         lifecycle.progress.text,
         "● MCP fixture halfway",
     ) != null);
-}
-
-test "background callbacks publish ready success failure and cancellation semantics" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-
-    Bindings(FakeApp).onBackgroundUrlReady(&app, 7, "http://localhost:3000");
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 7, .state = .exited, .exit_code = 0 });
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 8, .state = .failed, .exit_code = 2 });
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 9, .state = .stopped, .exit_code = null });
-
-    try std.testing.expectEqual(@as(usize, 4), app.worker.events.items.len);
-    const ready = app.worker.events.items[0].semantic_notice;
-    try std.testing.expectEqualStrings("background", ready.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, ready.tone);
-    try std.testing.expectEqualStrings("Command #7 server ready at http://localhost:3000.", ready.body);
-    const succeeded = app.worker.events.items[1].semantic_notice;
-    try std.testing.expectEqualStrings("background", succeeded.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, succeeded.tone);
-    try std.testing.expectEqualStrings("Command #7 completed successfully.", succeeded.body);
-    const failed = app.worker.events.items[2].semantic_notice;
-    try std.testing.expectEqualStrings("background", failed.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", failed.tone);
-    try std.testing.expectEqualStrings("Command #8 failed (exit 2).", failed.body);
-    const cancelled = app.worker.events.items[3].semantic_notice;
-    try std.testing.expectEqualStrings("background", cancelled.topic);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, cancelled.tone);
-    try std.testing.expectEqualStrings("Command #9 stopped.", cancelled.body);
-
-    for (app.worker.events.items) |event| {
-        const notice = event.semantic_notice;
-        try std.testing.expect(std.mem.find(u8, notice.body, "Background") == null);
-    }
 }
 
 test "agent context and system notices share semantic transport with distinct fields" {

@@ -43,14 +43,19 @@ pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows)
 else
     null;
 
-fn productPath() ![]const u8 {
-    const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse
-        return error.TestProductExecutableMissing;
-    return std.mem.sliceTo(path_z, 0);
+fn productPath() ![]u8 {
+    return std.testing.environ.getAlloc(
+        std.testing.allocator,
+        "FX_TEST_PRODUCT_EXE",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => error.TestProductExecutableMissing,
+        else => err,
+    };
 }
 
 fn runProduct(args: []const []const u8) !std.process.RunResult {
     const executable = try productPath();
+    defer std.testing.allocator.free(executable);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(std.testing.allocator);
     try argv.append(std.testing.allocator, executable);

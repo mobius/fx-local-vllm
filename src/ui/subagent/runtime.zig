@@ -6,6 +6,7 @@ const types = @import("../../core/shared/types.zig");
 const domain = @import("../../core/subagent/domain.zig");
 const execution = @import("../../core/subagent/execution.zig");
 const diff_mod = @import("../../core/output/diff.zig");
+const full_transcript_page = @import("../../core/output/full_transcript_page.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const worker_runtime = @import("../../core/agent/worker_runtime.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -824,7 +825,7 @@ pub const ChildPresentationView = struct {
 const ChildViewportBookmark = struct {
     rows_from_bottom: usize,
     prior_total_rows: ?usize,
-    full_transcript: ?transcript_presentation.Snapshot,
+    full_transcript: ?transcript_runtime.TranscriptRuntime.FullTranscriptViewportSnapshot,
 };
 
 const ChildDraft = struct {
@@ -966,11 +967,15 @@ pub const Runtime = struct {
         return self.main_approval_presented;
     }
 
-    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
-        if (!self.main_approval_presented) return null;
+    pub fn mainApprovalCardBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
         const card = self.main_approval_card orelse return null;
         if (card.prompt_id != prompt_id) return null;
         return .{ .child_id = card.child_id, .approval_id = card.approval_id };
+    }
+
+    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.main_approval_presented) return null;
+        return self.mainApprovalCardBinding(prompt_id);
     }
 
     pub fn dismissMainApproval(self: *Runtime) void {
@@ -1073,6 +1078,13 @@ pub const Runtime = struct {
             return null;
         }
         return self.selected_terminal_id;
+    }
+
+    pub fn selectedTerminalAttachable(self: *const Runtime) bool {
+        const session_id = self.selectedTerminalId() orelse return false;
+        const snapshot = self.terminal_snapshot orelse return false;
+        const row = findVisibleTerminal(snapshot.rows, session_id) orelse return false;
+        return row.attachable;
     }
 
     pub fn setDegraded(self: *Runtime, alloc: Allocator, failure: manager_mod.FailureCode) void {
@@ -1944,6 +1956,11 @@ pub const Runtime = struct {
             _ = try runtime.setTranscriptPresentationDepth(alloc, requested);
         }
         self.child.presentation_transcript_depth = requested;
+        if (requested == .inline_mode) {
+            if (self.selected_child_viewport) |*viewport| {
+                viewport.full_transcript = null;
+            }
+        }
         return requested;
     }
 
@@ -1957,6 +1974,9 @@ pub const Runtime = struct {
             _ = try runtime.setTranscriptPresentationDepth(alloc, .inline_mode);
         }
         self.child.presentation_transcript_depth = .inline_mode;
+        if (self.selected_child_viewport) |*viewport| {
+            viewport.full_transcript = null;
+        }
         return true;
     }
 
@@ -2006,9 +2026,20 @@ pub const Runtime = struct {
         errdefer if (live_work_id) |work_id| alloc.free(work_id);
         const full_transcript_bookmark = self.selectedChildFullTranscriptBookmark();
         if (full_transcript_bookmark) |bookmark| {
+            debug_trace.logf(
+                "subagent",
+                "child_full_viewport_restore depth={s} scroll_rows={d} follow_tail={}",
+                .{
+                    @tagName(bookmark.presentation.depth),
+                    bookmark.presentation.scroll_rows,
+                    bookmark.presentation.follow_tail,
+                },
+            );
             runtime.restoreFullTranscriptViewport(bookmark);
-            self.child.presentation_transcript_depth = bookmark.depth;
-            self.selected_child_viewport.?.full_transcript = null;
+            self.child.presentation_transcript_depth = bookmark.presentation.depth;
+            if (bookmark.presentation.depth == .full) {
+                runtime.deferRestoredFullTranscriptOpen();
+            }
         } else if (runtime.transcriptPresentationDepth() !=
             self.child.presentation_transcript_depth)
         {
@@ -3834,19 +3865,31 @@ pub const Runtime = struct {
         const child_id = self.childRouteId() orelse return;
         const selected_id = self.selected_id orelse return;
         if (!std.mem.eql(u8, selected_id, child_id)) return;
+        const full_transcript = if (self.child.presentation) |*runtime|
+            runtime.snapshotFullTranscriptViewport()
+        else
+            null;
+        if (full_transcript) |bookmark| {
+            debug_trace.logf(
+                "subagent",
+                "child_full_viewport_remember depth={s} scroll_rows={d} follow_tail={}",
+                .{
+                    @tagName(bookmark.presentation.depth),
+                    bookmark.presentation.scroll_rows,
+                    bookmark.presentation.follow_tail,
+                },
+            );
+        }
         self.selected_child_viewport = .{
             .rows_from_bottom = self.child.scroll_from_bottom,
             .prior_total_rows = self.child.rendered_chat_rows,
-            .full_transcript = if (self.child.presentation) |*runtime|
-                runtime.snapshotFullTranscriptViewport()
-            else
-                null,
+            .full_transcript = full_transcript,
         };
     }
 
     fn selectedChildFullTranscriptBookmark(
         self: *const Runtime,
-    ) ?transcript_presentation.Snapshot {
+    ) ?transcript_runtime.TranscriptRuntime.FullTranscriptViewportSnapshot {
         const child_id = self.childRouteId() orelse return null;
         const selected_id = self.selected_id orelse return null;
         if (!std.mem.eql(u8, selected_id, child_id)) return null;
@@ -4997,7 +5040,7 @@ fn paintActions(
     try writeLine(alloc, writer, cols, row, limit, "R Retry queued external work or resume interrupted work");
     switch (projection.cancellationCapability(node.state, node.external_busy)) {
         .available => try writeLine(alloc, writer, cols, row, limit, "C Cancel active/queued work; preserve persistent chat and return idle"),
-        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another Fx process owns this child."),
+        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another fx process owns this child."),
         .inactive => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: this child has no active or queued work."),
     }
     try writeLine(alloc, writer, cols, row, limit, "X Close and archive chat (separate from navigation)");
@@ -5606,7 +5649,8 @@ fn terminalSnapshotsEqual(
             !std.mem.eql(u8, left.label, right.label) or
             left.lifecycle != right.lifecycle or
             !std.meta.eql(left.attention, right.attention) or
-            left.backend != right.backend)
+            left.backend != right.backend or
+            left.attachable != right.attachable)
         {
             return false;
         }
@@ -6178,14 +6222,14 @@ test "child command approval route exposes complete scroll review and resolves" 
     snapshot.nodes[0].approvals = try alloc.alloc(projection.Approval, 1);
     const command = try std.fmt.allocPrint(
         alloc,
-        "# terminal.exec profile=user shell=/bin/zsh\n{s}COMMAND_TAIL_VISIBLE",
+        "# shell.run profile=user shell=/bin/zsh\n{s}COMMAND_TAIL_VISIBLE",
         .{"printf review-line\\n\n" ** 20},
     );
     snapshot.nodes[0].approvals[0] = .{
         .id = try alloc.dupe(u8, "command-approval-id"),
         .kind = .tool,
         .status = .pending,
-        .label = try alloc.dupe(u8, "terminal.exec printf ok"),
+        .label = try alloc.dupe(u8, "shell.run printf ok"),
         .explanation = null,
         .command = command,
     };
@@ -6227,7 +6271,7 @@ test "pending command approval route shows profile and keeps authoritative decis
     var snapshot = try pendingApprovalTestSnapshot(alloc, "pending-command-id");
     snapshot.pending_approvals[0].request.command = try alloc.dupe(
         u8,
-        "# terminal.exec profile=clean shell=/bin/bash\nprintf ok",
+        "# shell.run profile=clean shell=/bin/bash\nprintf ok",
     );
     try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
     try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .notifications));
@@ -6722,16 +6766,16 @@ test "child approval card preserves the semantic label and live preview" {
     var snapshot = try pendingApprovalTestSnapshot(alloc, "semantic-label-id");
     alloc.free(snapshot.pending_approvals[0].request.label);
     snapshot.pending_approvals[0].request.label =
-        try alloc.dupe(u8, "terminal.exec touch child-marker");
+        try alloc.dupe(u8, "shell.run touch child-marker");
     snapshot.pending_approvals[0].request.command =
-        try alloc.dupe(u8, "# terminal.exec profile=user shell=/bin/zsh\ntouch child-marker");
+        try alloc.dupe(u8, "# shell.run profile=user shell=/bin/zsh\ntouch child-marker");
     snapshot.pending_approvals[0].tool_arguments_preview =
         try alloc.dupe(u8, "{\"text\":\"child sentinel\"}");
     try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
 
     const card = runtime.mainApprovalRequest().?;
     try std.testing.expectEqualStrings(
-        "terminal.exec touch child-marker",
+        "shell.run touch child-marker",
         card.label,
     );
     switch (card.origin) {
@@ -6746,7 +6790,7 @@ test "child approval card preserves the semantic label and live preview" {
         card.tool_arguments_preview.?,
     );
     try std.testing.expectEqualStrings(
-        "# terminal.exec profile=user shell=/bin/zsh\ntouch child-marker",
+        "# shell.run profile=user shell=/bin/zsh\ntouch child-marker",
         card.command.?,
     );
 }
@@ -7004,7 +7048,7 @@ test "external owner makes manager cancellation unavailable" {
     );
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Current state: external busy") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "another Fx process owns this child") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "another fx process owns this child") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "C cancel") == null);
     try std.testing.expectEqual(Command.none, try runtime.handleByte(alloc, 'c', null));
     try std.testing.expect(runtime.lifecycle_action == null);
@@ -7351,14 +7395,14 @@ test "main approval notification opens from an empty manager without owning reso
     const layout = types.Layout{ .rows = 9, .cols = 72, .content_bottom = 5, .divider_top_row = 6, .input_row = 7, .divider_bottom_row = 8, .hint_row = 9 };
     const rendered = try paint(alloc, &runtime, layout, .{
         .id = 42,
-        .label = "terminal.exec zig build test",
+        .label = "shell.run zig build test",
         .explanation = "requires confirmation",
         .command = "zig build test",
     });
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Main chat approval") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Request ID: 42") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "terminal.exec zig build test") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "shell.run zig build test") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Read-only here") != null);
 
     runtime.setDegraded(alloc, .store_failure);
@@ -8002,8 +8046,8 @@ test "child transcript depth survives transient presentation rebuilds" {
         try runtime.handle(alloc, .enter),
     );
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
-        try runtime.setChildTranscriptPresentationDepth(alloc, .review),
+        transcript_presentation.Depth.full,
+        try runtime.setChildTranscriptPresentationDepth(alloc, .full),
     );
     try std.testing.expect(runtime.childFullTranscriptRequested());
     try std.testing.expect(runtime.childConversationRuntime() == null);
@@ -8071,6 +8115,49 @@ test "child transcript depth survives transient presentation rebuilds" {
     );
     runtime.child.clear(alloc);
     try std.testing.expect(!runtime.childFullTranscriptRequested());
+}
+
+test "child full transcript viewport survives manager close and reopen" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(try runtime.replaceSnapshot(
+        alloc,
+        try testSnapshot(alloc, 1, &.{"child"}),
+    ));
+    try std.testing.expectEqual(Command.child_changed, try runtime.handle(alloc, .enter));
+
+    var first: transcript_runtime.TranscriptRuntime = .{};
+    first.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, first, .empty, null, 1);
+    _ = try runtime.setChildTranscriptPresentationDepth(alloc, .full);
+    const child = runtime.childConversationRuntime().?;
+    child.full_transcript.scroll_rows = 37;
+    child.full_transcript.follow_tail = false;
+    child.full_transcript_page_anchor = .{ .entry_index = 17 };
+
+    runtime.resetForOpen(alloc);
+    try std.testing.expectEqual(Command.child_changed, try runtime.handle(alloc, .enter));
+
+    var restored: transcript_runtime.TranscriptRuntime = .{};
+    restored.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, restored, .empty, null, 1);
+    const reopened = runtime.childConversationRuntime().?;
+    try std.testing.expectEqual(@as(u32, 37), reopened.full_transcript.scroll_rows);
+    try std.testing.expect(!reopened.full_transcript.follow_tail);
+    try std.testing.expect(std.meta.eql(
+        @as(full_transcript_page.Anchor, .{ .entry_index = 17 }),
+        reopened.full_transcript_page_anchor,
+    ));
+
+    runtime.child.clearPresentation(alloc);
+    var rebuilt: transcript_runtime.TranscriptRuntime = .{};
+    rebuilt.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, rebuilt, .empty, null, 1);
+    const after_rebuild = runtime.childConversationRuntime().?;
+    try std.testing.expectEqual(@as(u32, 37), after_rebuild.full_transcript.scroll_rows);
+    try std.testing.expect(!after_rebuild.full_transcript.follow_tail);
 }
 
 test "child paste is bounded UTF-8 safe atomic and retry stable" {

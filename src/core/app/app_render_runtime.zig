@@ -6,6 +6,8 @@ const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_terminal_runtime = @import("app_terminal_runtime.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -41,8 +43,8 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
-const skills_screen = @import("../../ui/skills_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const render_engine = @import("../../ui/render_engine.zig");
 const build_checkpoint = @import("../../ui/render_engine/build_checkpoint.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -597,8 +599,7 @@ pub fn Runtime(comptime App: type) type {
             const visible_model = pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
-            const model_supports_fast = visible_capabilities.supports_fast_mode or
-                (active_capabilities_pending and app.fast_mode);
+            const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
                 (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
@@ -607,10 +608,16 @@ pub fn Runtime(comptime App: type) type {
                 app.effort
             else
                 .auto;
-            const visible_fast_mode = if (pending_model != null and model_supports_fast)
-                pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index)
+            const active_fast_mode_model_bound = if (comptime @hasDecl(App, "fastModeModelBound"))
+                app.fastModeModelBound()
             else
-                app.fast_mode;
+                true;
+            const fast_indicator_active = if (pending_model != null)
+                visible_capabilities.intrinsic_fast or
+                    (model_supports_fast and pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index))
+            else
+                visible_capabilities.intrinsic_fast or
+                    (app.fast_mode and active_fast_mode_model_bound);
 
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
@@ -641,6 +648,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .ask,
                 .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
+                .steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+                    queue_preview.steering_count
+                else
+                    0,
                 .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
                     queue_preview.paused
                 else
@@ -663,8 +674,7 @@ pub fn Runtime(comptime App: type) type {
                 .selected_subagent_status = null,
                 .selected_subagent_tool_calls = 0,
                 .selected_subagent_activity = null,
-                .fast_mode = visible_fast_mode,
-                .model_supports_fast = model_supports_fast,
+                .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
@@ -700,6 +710,26 @@ pub fn Runtime(comptime App: type) type {
                     render_input.skillsMenuProjection(&app.skills)
                 else
                     .{},
+                .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
+                    const view = app.mcp.menuView();
+                    break :blk .{
+                        .state = view.state,
+                        .servers = if (view.health) |health| health.servers else &.{},
+                        .tools = view.tools,
+                        .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
+                        .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
+                        .prompts = if (view.prompts) |catalog| catalog.items else &.{},
+                        .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                        .preview = view.preview,
+                        .feedback = view.feedback,
+                        .add_name = view.add_form.name.items,
+                        .add_target = view.add_form.target.items,
+                        .add_arguments = view.add_form.arguments.items,
+                        .add_draft = app.input_runtime.edit_state.input.items,
+                        .arguments = view.argument_fields,
+                        .argument_draft = app.input_runtime.edit_state.input.items,
+                    };
+                } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
                     app.slashRegistry(),
@@ -1134,7 +1164,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .open_model_picker,
                 .turn_token_update,
-                .tool_payload_started,
+                .turn_phase_update,
                 .finish_prompt,
                 .session_grant,
                 => {},
@@ -1249,8 +1279,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.subagent_view_active = false;
             ctx.selected_subagent_label = display_name;
             ctx.selected_subagent_status = chat.state;
-            ctx.fast_mode = false;
-            ctx.model_supports_fast = capabilities.supports_fast_mode;
+            ctx.fast_indicator_active = capabilities.intrinsic_fast;
             ctx.effort = chat.configuration.effort orelse .auto;
             ctx.model_supports_effort = capabilities.reasoning_efforts.len > 0;
             ctx.ctrl_c_pending = view.editor.gestures.ctrlCExitArmed();
@@ -1260,15 +1289,19 @@ pub fn Runtime(comptime App: type) type {
             ctx.file_completions = &.{};
             ctx.inline_completion_suffix = "";
             ctx.auth_picker.active = false;
-            ctx.skills_menu = .{};
+            ctx.skills_menu = if (comptime @hasField(App, "skills"))
+                render_input.skillsMenuProjection(&app.skills)
+            else
+                .{};
+            ctx.mcp_menu = .{};
             ctx.help_menu = .{};
-            ctx.settings_menu = .{};
+            ctx.settings_menu.active = false;
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))
                 render_input.modelMenuProjection(&app.model_cache)
             else
                 .{};
             ctx.session_menu = .{};
-            ctx.statusline_menu = .{};
+            ctx.statusline_menu.active = false;
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";
@@ -1773,7 +1806,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false;
                 if (surface_changed) {
-                    if (!modelMenuActive(app)) {
+                    if (!modelMenuActive(app) and !skillsMenuActive(app)) {
                         presentation_shell.invalidateTranscriptAnchor(
                             "subagent child surface activated",
                         );
@@ -1820,9 +1853,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 main_footer_ctx;
-            if (child_view != null and skillsMenuActive(app)) {
-                return renderChildSkillsScreen(app, footer_ctx);
-            }
             const render_reconciliation = if (child_view != null)
                 InlineRenderReconciliation{ .alternate_screen_owns_rendering = true }
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
@@ -1855,6 +1885,13 @@ pub fn Runtime(comptime App: type) type {
             defer if (owned_transcript_source) |*source| source.deinit(app.alloc);
             var transcript_source: ?*transcript_runtime.TranscriptPreparationSource = null;
             var full_transcript_projection: ?*full_transcript_screen.Projection = null;
+            var full_transcript_capability: ?*session_child_store.SessionChildCapability = if (comptime @hasDecl(
+                App,
+                "fullTranscriptSidecarCapability",
+            ))
+                app.fullTranscriptSidecarCapability()
+            else
+                null;
             var transcript_transition: ?transcript_runtime.TranscriptTransition = null;
             defer if (transcript_transition) |*transition| transition.deinit(app.alloc);
             var footer_measurement: ?surface_frame.SurfaceFooterMeasurement = null;
@@ -1885,11 +1922,14 @@ pub fn Runtime(comptime App: type) type {
                             app.fullTranscriptDiffResolver()
                         else
                             null;
-                    full_transcript_projection = try presentation_shell.cachedFullTranscriptProjectionInterruptible(
-                        app.alloc,
+                    full_transcript_projection = try presentation_shell.preparedFullTranscriptPageProjectionInterruptible(
                         full_diff_resolver,
+                        full_transcript_capability,
                         checkpoint,
                     );
+                    if (presentation_shell.preparedFullTranscriptPageCapability()) |capability| {
+                        full_transcript_capability = capability;
+                    }
                 }
                 footer_measurement = try surface_frame.measureSurfaceFooter(
                     app.alloc,
@@ -2143,20 +2183,20 @@ pub fn Runtime(comptime App: type) type {
                 if (full_transcript_projection) |projection| {
                     const area = footer_frame.paint.transcript_band;
                     if (!area.isEmpty()) {
-                        const capability = if (comptime @hasDecl(App, "fullTranscriptSidecarCapability"))
-                            app.fullTranscriptSidecarCapability()
-                        else
-                            null;
                         const staged = try presentation_shell.prepareFullTranscriptSurfacePaintInterruptible(
                             app.alloc,
                             &app.metrics,
                             projection,
-                            capability,
+                            full_transcript_capability,
                             .{ .top = area.top, .bottom = area.bottom },
                             checkpoint,
                         );
-                        owned_transcript_source = staged.source;
-                        transcript_source = &owned_transcript_source.?;
+                        if (staged.owned_source) |source| {
+                            owned_transcript_source = source;
+                            transcript_source = &owned_transcript_source.?;
+                        } else {
+                            transcript_source = staged.borrowed_source.?;
+                        }
                         prepared_transcript = staged.prepared;
                         footer_frame.paint.viewport = prepared_transcript.?.selection;
                         try validatePreparedTranscriptFitsPlan(&prepared_transcript.?, footer_frame.paint);
@@ -2507,46 +2547,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn renderChildSkillsScreen(
-            app: *App,
-            ctx: render_input.RenderContext,
-        ) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "skills")) {
-                return error.MissingSkillsScreenRuntime;
-            }
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try skills_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .skills = render_input.skillsMenuProjection(&app.skills),
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = &.{},
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = true,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(
-                &app.shell,
-                &app.metrics,
-                screen.bytes,
-            );
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
         fn renderSubagentManagerScreen(app: *App) !FrameAttemptResult {
             if (comptime !@hasField(App, "terminal")) return .{
                 .shadow_state = .committed,
@@ -2648,7 +2648,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn skillsMenuActive(app: *const App) bool {
-            if (comptime @hasField(App, "skills")) return app.skills.menu.active;
+            if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
         }
 
@@ -2793,24 +2793,31 @@ pub fn Runtime(comptime App: type) type {
             force: bool,
             comptime count_only: bool,
         ) !void {
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
+            const optional_host = app_session_runtime.Runtime(App).subagentHost(app);
+            const now_ms = io_mod.milliTimestamp();
+            const refresh_due = if (optional_host) |host|
+                if (comptime @hasDecl(
+                    @TypeOf(app.subagents),
+                    "projectionRefreshDue",
+                ))
+                    app.subagents.projectionRefreshDue(
+                        now_ms,
+                        force,
+                        host.approvals.pendingRevision(),
+                    )
+                else
+                    app.subagents.refreshDue(now_ms, force)
+            else
+                app.subagents.refreshDue(now_ms, force);
+            if (!refresh_due) return;
+            if (comptime !count_only) {
+                try refreshManagedExecutionProjection(app);
+            }
+            const host = optional_host orelse {
                 app.subagents.setDegraded(app.alloc, .store_failure);
                 requestSubagentSurfaceFrame(app, .subagent_panel);
                 return;
             };
-            const now_ms = io_mod.milliTimestamp();
-            const refresh_due = if (comptime @hasDecl(
-                @TypeOf(app.subagents),
-                "projectionRefreshDue",
-            ))
-                app.subagents.projectionRefreshDue(
-                    now_ms,
-                    force,
-                    host.approvals.pendingRevision(),
-                )
-            else
-                app.subagents.refreshDue(io_mod.milliTimestamp(), force);
-            if (!refresh_due) return;
             const source = subagent_projection.Source{
                 .root_id = host.root_id,
                 .manager = &host.manager,
@@ -2868,11 +2875,17 @@ pub fn Runtime(comptime App: type) type {
                     requestSubagentSurfaceFrame(app, .subagent_panel);
                 },
             }
-            if (comptime @hasField(App, "terminal_client") and
-                @hasDecl(@TypeOf(app.terminal_client), "terminalProjection") and
+        }
+
+        fn refreshManagedExecutionProjection(app: *App) !void {
+            if (comptime @hasField(App, "managed_executions") and
                 @hasDecl(@TypeOf(app.subagents), "replaceTerminalSnapshot"))
             {
-                const terminal_snapshot = try app.terminal_client.terminalProjection(app.alloc);
+                try app_terminal_runtime.Runtime(App).refreshManagedFacts(app);
+                const terminal_snapshot = try managedExecutionProjection(
+                    app.alloc,
+                    &app.managed_executions,
+                );
                 if (try app.subagents.replaceTerminalSnapshot(app.alloc, terminal_snapshot)) {
                     requestSubagentSurfaceFrame(app, .subagent_panel);
                 }
@@ -3249,6 +3262,45 @@ pub fn Runtime(comptime App: type) type {
             };
         }
     };
+}
+
+fn managedExecutionProjection(
+    alloc: std.mem.Allocator,
+    runtime: *managed_execution.Runtime,
+) !terminal_ui_projection.Snapshot {
+    const executions = try runtime.list(alloc);
+    defer {
+        for (executions) |*execution| execution.deinit(alloc);
+        alloc.free(executions);
+    }
+    const rows = try alloc.alloc(terminal_ui_projection.Row, executions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |*row| {
+            alloc.free(row.label);
+            alloc.free(row.session_id);
+        }
+        alloc.free(rows);
+    }
+    for (executions, rows) |execution, *row| {
+        const session_id = try alloc.dupe(u8, execution.execution_id);
+        errdefer alloc.free(session_id);
+        row.* = .{
+            .session_id = session_id,
+            .label = try alloc.dupe(u8, execution.command),
+            .lifecycle = switch (execution.state) {
+                .running => .running,
+                .completed => .exited,
+                .stopped => .closed,
+                .lost => .lost,
+            },
+            .attention = .{},
+            .backend = .native,
+            .attachable = execution.backend == .tty,
+        };
+        initialized += 1;
+    }
+    return .{ .alloc = alloc, .rows = rows };
 }
 
 fn renderReasonNames(
@@ -4617,6 +4669,7 @@ const CoordinatorTestApp = struct {
     effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
+    intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -4666,10 +4719,13 @@ const CoordinatorTestApp = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
-        const fallback = model_capabilities.Capabilities{
+        var fallback = model_capabilities.Capabilities{
             .prompt_caching = true,
             .context_window = 1_000_000,
         };
+        if (self.intrinsic_fast_model) |intrinsic_model| {
+            fallback.intrinsic_fast = std.mem.eql(u8, intrinsic_model, model);
+        }
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {
                 return model_capabilities.mergeCapabilities(
@@ -4805,8 +4861,7 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         ctx.permission_mode,
         ctx.queued_count,
         null,
-        ctx.fast_mode,
-        ctx.model_supports_fast,
+        ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
@@ -4817,6 +4872,69 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         "run /login · ask · opus 4.8 · xhigh · ⚡︎",
         line,
     );
+}
+
+test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hydration" {
+    const cases = [_]struct {
+        model: []const u8,
+        fast_mode: bool,
+        intrinsic_fast: bool,
+        supports_fast_mode: bool,
+        expected_indicator: bool,
+    }{
+        .{ .model = "moonshotai/kimi-k3", .fast_mode = false, .intrinsic_fast = false, .supports_fast_mode = true, .expected_indicator = false },
+        .{ .model = "moonshotai/kimi-k3", .fast_mode = true, .intrinsic_fast = false, .supports_fast_mode = true, .expected_indicator = true },
+        .{ .model = "moonshotai/kimi-k3-fast", .fast_mode = false, .intrinsic_fast = true, .supports_fast_mode = false, .expected_indicator = true },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ true, false }) |catalog_loading| {
+            var app = CoordinatorTestApp{
+                .alloc = std.testing.allocator,
+                .shell = .{},
+                .model_cache_loading = catalog_loading,
+                .fast_mode = case.fast_mode,
+                .intrinsic_fast_model = if (case.intrinsic_fast) case.model else null,
+                .gateway_metadata_model = if (catalog_loading) null else case.model,
+                .gateway_metadata = .{ .supports_fast_mode = case.supports_fast_mode },
+            };
+            defer app.deinit();
+            try app.selected_model.appendSlice(std.testing.allocator, case.model);
+
+            var upgrade_status_buf: [64]u8 = undefined;
+            const queued_cards: QueuedCardProjection = .{};
+            const ctx = Runtime(CoordinatorTestApp).footerContext(
+                &app,
+                &upgrade_status_buf,
+                0,
+                &queued_cards,
+            );
+
+            try std.testing.expectEqual(case.expected_indicator, ctx.fast_indicator_active);
+        }
+    }
+}
+
+test "core.app_render_runtime keeps a bound fast preference stable after catalog hydration" {
+    var app = CoordinatorTestApp{
+        .alloc = std.testing.allocator,
+        .shell = .{},
+        .fast_mode = true,
+        .gateway_metadata_model = "anthropic/claude-fable-5",
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    try std.testing.expect(ctx.fast_indicator_active);
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {
@@ -4901,7 +5019,6 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         0,
         null,
         false,
-        true,
         .auto,
         true,
         statusline,
@@ -6279,7 +6396,7 @@ test "core.app_render_runtime generic approval exits the full transcript screen 
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 42,
-        .label = "terminal.exec sh -c 'printf approval'",
+        .label = "shell.run sh -c 'printf approval'",
     }));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -6570,6 +6687,69 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
         state_after_rewrite,
     );
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "stream completed"));
+}
+
+test "core.app_render_runtime full transcript defers repaint until its page is ready" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(
+        std.testing.io,
+        "full-transcript-deferred-frame.log",
+        .{ .read = true },
+    );
+    defer file.close(io_mod.getIo());
+
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = file,
+            .layout = .{
+                .rows = 24,
+                .cols = 96,
+                .content_bottom = 20,
+                .divider_top_row = 21,
+                .input_row = 22,
+                .divider_bottom_row = 23,
+                .hint_row = 24,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+        },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(
+        alloc,
+        &app.metrics,
+        ("historical transcript row\n" ** 512) ++ "FULL_ASYNC_SENTINEL\n",
+        true,
+    );
+    app.shell.render_requests.request(.first_frame);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try std.testing.expect(!try coordinatorGridContains(
+        app.shell.shadow_vt.?.*,
+        "Preparing full detail",
+    ));
+
+    for (0..100_000) |_| {
+        _ = try app.shell.pollFullTranscriptPageLoad();
+        if (app.shell.fullTranscriptPreparedForOpen()) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
+    app.shell.render_requests.request(.transcript);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(try coordinatorGridContains(
+        app.shell.shadow_vt.?.*,
+        "FULL_ASYNC_SENTINEL",
+    ));
 }
 
 test "core.app_render_runtime changed resized full transcript close preserves primary history without full replay" {
@@ -6936,7 +7116,7 @@ const ChildApprovalReconcileApp = struct {
     }
 };
 
-test "child approval arrival closes review and full transcript depths before rendering" {
+test "child approval arrival closes full transcript depth before rendering" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6948,42 +7128,32 @@ test "child approval arrival closes review and full transcript depths before ren
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "full_transcript");
 
-    inline for (.{
-        transcript_presentation.Depth.review,
-        transcript_presentation.Depth.full,
-    }) |depth| {
-        var app = ChildApprovalReconcileApp{
-            .alloc = alloc,
-            .subagents = .{ .depth = depth },
-        };
-        defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .id = 91,
-            .label = "terminal.exec npm test",
-        }));
+    var app = ChildApprovalReconcileApp{
+        .alloc = alloc,
+        .subagents = .{ .depth = .full },
+    };
+    defer app.deinit();
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+        .id = 91,
+        .label = "shell.run npm test",
+    }));
 
-        try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
-            .reconcileChildTranscriptForPresentedApproval(
-            &app,
-            "selected-child",
-        ));
+    try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
+        .reconcileChildTranscriptForPresentedApproval(
+        &app,
+        "selected-child",
+    ));
 
-        try std.testing.expectEqual(
-            transcript_presentation.Depth.inline_mode,
-            app.subagents.depth,
-        );
-        try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
-    }
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        app.subagents.depth,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
 
     var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer trace_file.close(std.testing.io);
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "depth_transition from=review to=inline route=child trigger=approval_handoff",
-    ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,

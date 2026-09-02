@@ -984,6 +984,23 @@ pub const LoadedWritableSession = struct {
     }
 };
 
+/// Preserves each call's exact error set while sharing one dynamic return ABI.
+pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritableSession {
+    return @errorCast(failLoadedWritableSessionDynamic(err));
+}
+
+noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
+    return err;
+}
+
+test "large session errors preserve their exact error type and identity" {
+    const result = failLoadedWritableSession(error.NoSavedSessions);
+    try std.testing.expect(
+        @TypeOf(result) == error{NoSavedSessions}!LoadedWritableSession,
+    );
+    try std.testing.expectError(error.NoSavedSessions, result);
+}
+
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
@@ -1123,21 +1140,24 @@ pub const Root = struct {
         var lifecycle_value = lifecycle;
         errdefer if (lifecycle_value) |*value| value.deinit(alloc);
         if (self.mode != .writable or self.sessions == null) {
-            return error.SessionStoreUnavailable;
+            return failLoadedWritableSession(error.SessionStoreUnavailable);
         }
         try session_codec.validateState(initial_state);
         const sessions = &self.sessions.?;
-        if (try entryExists(sessions, initial_state.id)) return error.SessionAlreadyExists;
+        if (try entryExists(sessions, initial_state.id)) {
+            return failLoadedWritableSession(error.SessionAlreadyExists);
+        }
 
         sessions.dir.createDir(
             io_mod.getIo(),
             initial_state.id,
             private_dir_permissions,
         ) catch |err| switch (err) {
-            error.PathAlreadyExists => return error.SessionAlreadyExists,
-            else => return error.SessionStartFailed,
+            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
+            else => return failLoadedWritableSession(error.SessionStartFailed),
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch return error.SessionStartFailed;
+        io_mod.syncVerifiedDir(sessions.dir) catch
+            return failLoadedWritableSession(error.SessionStartFailed);
 
         var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
         options.test_controls.lock(.session);
@@ -2357,7 +2377,9 @@ fn openWritableSession(
     var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
     defer event_log.close(io_mod.getIo());
     const length = try event_log.length(io_mod.getIo());
-    if (length < position.through_event_log_bytes) return error.InvalidSessionFormat;
+    if (length < position.through_event_log_bytes) {
+        return failLoadedWritableSession(error.InvalidSessionFormat);
+    }
     const replay_started_ns = io_mod.nanoTimestamp();
     var open_state = loadOpenState(
         alloc,
@@ -2367,7 +2389,7 @@ fn openWritableSession(
         event_log,
         position,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.SessionReplayResourceExhausted,
+        error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
         else => return err,
     };
     errdefer open_state.state.deinit(alloc);
@@ -6833,17 +6855,10 @@ test "specialized history survives event replacement checkpoint and canonical co
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    const record_id = session.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const background_template = session.HistoryTurn{ .background_command = .{
+    const historical_template = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run dev") },
-        .assistant = @constCast("The server is starting."),
+        .assistant = @constCast("The historical command is inert."),
         .execution = .{ .tool_steps = steps[0..] },
-        .log_path = @constCast("/tmp/server.log"),
-        .expect_url = true,
-        .background_record_id = record_id,
     } };
     const interrupted_template = session.HistoryTurn{ .interrupted = .{
         .user = .{ .text = @constCast("inspect") },
@@ -6856,7 +6871,7 @@ test "specialized history survives event replacement checkpoint and canonical co
     const append_history = try alloc.alloc(session.HistoryTurn, 1);
     var owns_append_history = true;
     errdefer if (owns_append_history) alloc.free(append_history);
-    append_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    append_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     var append_history_initialized = true;
     errdefer if (owns_append_history and append_history_initialized) {
         session.freeHistoryTurn(alloc, append_history[0]);
@@ -6874,8 +6889,8 @@ test "specialized history survives event replacement checkpoint and canonical co
         .{},
     );
     try std.testing.expectEqualStrings(
-        "The server is starting.",
-        loaded.state.history[0].background_command.assistant.?,
+        "The historical command is inert.",
+        loaded.state.history[0].assistant.assistant,
     );
 
     var replacement = try loaded.state.dupe(alloc);
@@ -6889,7 +6904,7 @@ test "specialized history survives event replacement checkpoint and canonical co
         }
         alloc.free(replacement_history);
     };
-    replacement_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    replacement_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     copied_replacement_turns += 1;
     replacement_history[1] = try session.dupeHistoryTurn(alloc, interrupted_template);
     copied_replacement_turns += 1;
@@ -6913,11 +6928,10 @@ test "specialized history survives event replacement checkpoint and canonical co
     var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer replayed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), replayed.history.len);
-    const background = replayed.history[0].background_command;
-    try std.testing.expectEqualStrings("The server is starting.", background.assistant.?);
-    try std.testing.expectEqual(@as(usize, 1), background.execution.tool_steps.len);
-    try std.testing.expectEqual(.failure, background.execution.tool_steps[0].tool_results[0].status);
-    try std.testing.expectEqualSlices(u8, &record_id, &background.background_record_id.?);
+    const historical = replayed.history[0].assistant;
+    try std.testing.expectEqualStrings("The historical command is inert.", historical.assistant);
+    try std.testing.expectEqual(@as(usize, 1), historical.execution.tool_steps.len);
+    try std.testing.expectEqual(.failure, historical.execution.tool_steps[0].tool_results[0].status);
     const interrupted = replayed.history[1].interrupted;
     try std.testing.expectEqualStrings("I inspected the entry point.", interrupted.assistant.?);
     try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);

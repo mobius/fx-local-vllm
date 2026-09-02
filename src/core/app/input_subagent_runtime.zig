@@ -15,7 +15,6 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_input = @import("../subagent/input_action.zig");
-const catalog_screen_layout = @import("../../ui/catalog_screen_layout.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
@@ -378,6 +377,9 @@ pub fn SubagentRuntime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalId") and
                 @hasDecl(App, "requestTerminalOpen"))
             {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalAttachable")) {
+                    if (!app.subagents.selectedTerminalAttachable()) return;
+                }
                 const session_id = app.subagents.selectedTerminalId() orelse return;
                 switch (app.requestTerminalOpen(session_id)) {
                     .accepted, .occupied, .rejected => {},
@@ -777,8 +779,10 @@ pub fn SubagentRuntime(comptime App: type) type {
 
         fn syncChildSkillsQuery(app: *App) void {
             const view = app.subagents.childPresentationView() orelse return;
-            app.skills.menu.setQuery(view.editor.edit_state.input.items);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(
+                app.alloc,
+                view.editor.edit_state.input.items,
+            );
         }
 
         fn moveChildModelMenu(app: *App, delta: i32) void {
@@ -821,16 +825,21 @@ pub fn SubagentRuntime(comptime App: type) type {
                 app.shell.layout.cols,
                 &.{},
             );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
+            const capped = input_presentation.cappedInputRows(
                 scan.total_rows,
-                scan.cursor_row,
+                app.shell.layout.content_bottom,
+                true,
+            );
+            const row_budget = picker_presentation.inlinePickerRowBudget(
+                app.shell.layout.rows,
+                capped.input_extra,
+                0,
             );
             _ = app.skills.moveMenuSelectionVisibleRows(
                 delta,
-                skills_menu_presentation.visibleNavigationRowsForBudget(
+                skills_menu_presentation.inlineVisibleNavigationRowsForBudget(
                     render_input.skillsMenuProjection(&app.skills),
-                    layout.menu_row_budget,
+                    row_budget,
                 ),
             );
             app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(

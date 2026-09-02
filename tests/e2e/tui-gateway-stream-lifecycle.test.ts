@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 import {
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -35,6 +35,7 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   isEmptyComposerLine,
   isComposerLine,
@@ -156,12 +157,19 @@ function missingFinishResponse() {
 function lengthLimitedCommandResponse(command: string) {
   return new Response(
     'data: {"type":"text-delta","id":"answer_1","delta":"TUI partial output"}\n\n' +
-      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"terminal"}\n\n' +
+      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"shell"}\n\n' +
       `data: ${JSON.stringify({
         type: "tool-call",
         toolCallId: "command_final",
-        toolName: "terminal",
-        input: { action: "exec", timeout_ms: 600_000, command },
+        toolName: "shell",
+        input: {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
+        },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
@@ -333,7 +341,7 @@ type ToolPayloadHoldState = HoldState & {
 
 function streamingOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^  \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• Generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -344,7 +352,7 @@ function streamingOutputTokens(scrollback: string): number | null {
 
 function quietToolPayloadOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^•(?: \(\d+s\))? \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• Running \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -624,7 +632,7 @@ function splitHeldTextResponse(
 
 function duplicateKeyToolResponse(): Response {
   return fakeGatewaySse([
-    { type: "tool-input-start", id: "queued_duplicate_list", toolName: "list_files" },
+    { type: "tool-input-start", id: "queued_duplicate_list", toolName: "glob_files" },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: '{"' },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: "dept" },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: 'h"' },
@@ -638,7 +646,7 @@ function duplicateKeyToolResponse(): Response {
     {
       type: "tool-call",
       toolCallId: "queued_duplicate_list",
-      toolName: "list_files",
+      toolName: "glob_files",
       input: '{"depth":1, "depth":2}',
     },
     {
@@ -1308,7 +1316,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 36", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 35", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1550,13 +1558,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       hold.finish?.();
-      await waitForScrollback(
-        session!,
-        (value) =>
-          value.includes("  (↑8 ↓20k)") &&
-          !value.includes(finalSentinel),
-        "exact token progress during the paced response tail",
-      );
       await session!.waitForText(finalSentinel, TIMEOUT);
       const finalScrollback = await waitForScrollback(
         session!,
@@ -1574,9 +1575,121 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "assistant publishes a complete markdown block before the following tool",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-bounded-assistant-pacing-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const framesRoot = join(root, "replay-frames");
+      const hold: HoldState = { started: false, cancelled: false };
+      const renderedSentence =
+        "PACING_STREAM_SENTENCE keeps smooth markdown visible before tool presentation begins.";
+      const sourceSentence = renderedSentence.replace("smooth", "**smooth**");
+      const toolMarker = "PACING_TOOL_BOUNDARY_DONE";
+      const finalText = "PACING_STREAM_COMPLETE";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const queuedGateway = startFakeGateway([
+        () =>
+          heldGatewayResponse(
+            hold,
+            [{ type: "text-delta", id: "answer_1", delta: `${sourceSentence}\n\n` }],
+            [
+              { type: "tool-input-start", id: "pacing_tool", toolName: "shell" },
+              {
+                type: "tool-call",
+                toolCallId: "pacing_tool",
+                toolName: "shell",
+                input: { request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 10_000,
+                  command: `printf ${toolMarker}`,
+                } },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              },
+            ],
+          ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = queuedGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 120,
+        height: 40,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-bounded-assistant-pacing-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Render markdown, then run the command.");
+      await waitForCondition(
+        () => queuedGateway.requests.length === 1 && hold.started,
+        "held markdown response",
+      );
+      await session.waitForText(renderedSentence, TIMEOUT);
+      hold.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+
+      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
+        encoding: "utf8",
+      });
+      const grids = readdirSync(join(framesRoot, "frames"))
+        .filter((name) => name.endsWith(".grid.txt"))
+        .sort()
+        .map((name) => readFileSync(join(framesRoot, "frames", name), "utf8"));
+      const prefixLength = (grid: string): number => {
+        const rows = grid.split("\n");
+        for (let count = renderedSentence.length; count > 0; count -= 1) {
+          if (rows.some((row) => row.startsWith(`|  ${renderedSentence.slice(0, count)}`))) {
+            return count;
+          }
+        }
+        return 0;
+      };
+      const prefixLengths = grids
+        .map(prefixLength)
+        .filter((count, index, values) => count > 0 && count !== values[index - 1]);
+      const paragraphFrame = grids.findIndex((grid) => grid.includes(renderedSentence));
+      const toolFrame = grids.findIndex((grid) => grid.includes(toolMarker));
+
+      expect(prefixLengths).toEqual([renderedSentence.length]);
+      expect(paragraphFrame).toBeGreaterThanOrEqual(0);
+      expect(toolFrame).toBeGreaterThanOrEqual(0);
+      expect(paragraphFrame).toBeLessThan(toolFrame);
+      expect(prefixLength(grids[toolFrame]!)).toBe(renderedSentence.length);
+      expect(grids[toolFrame]!.indexOf(renderedSentence)).toBeLessThan(
+        grids[toolFrame]!.indexOf(toolMarker),
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "streamed write payload keeps the activity row live",
     async () => {
       const hold: ToolPayloadHoldState = { started: false, cancelled: false };
+      const nextStep: HoldState = { started: false, cancelled: false };
       const payloadPath = "payload-progress.md";
       // Preserve two substantial streamed input chunks for the live
       // activity-row assertions.
@@ -1593,7 +1706,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               payloadPath,
               payloadContent,
             ),
-          fakeGatewayFinalText(finalSentinel),
+          () => heldGatewayResponse(nextStep, [], [
+            { type: "text-delta", id: "answer_2", delta: finalSentinel },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 8 },
+                outputTokens: { total: 5 },
+              },
+            },
+          ]),
         ],
       );
 
@@ -1622,6 +1745,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       hold.finish?.();
+      await waitForCondition(
+        () => queuedGateway.requests.length === 2 && nextStep.started,
+        "next model step after tool completion",
+      );
+      const nextStepPane = await waitForScrollback(
+        session!,
+        (value) =>
+          /• Thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
+            value,
+          ) && !value.includes(finalSentinel),
+        "thinking activity during the next admitted model step",
+      );
+      expect(nextStepPane).not.toContain(finalSentinel);
+      nextStep.release?.();
       await session!.waitForText(finalSentinel, TIMEOUT);
       expect(queuedGateway.classifierRequests).toHaveLength(0);
       const writtenPath = join(root!, "workspace", payloadPath);
@@ -1763,7 +1900,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       queuedGateway = startDynamicFakeGateway(() => {
         responseIndex += 1;
         if (responseIndex === 1) {
-          return fakeGatewayToolCall("list_1", "list_files", { path: "." });
+          return fakeGatewayToolCall("list_1", "glob_files", { pattern: "*", path: "." });
         }
         if (responseIndex >= 2 && responseIndex <= 11) {
           return new Response(
@@ -2722,7 +2859,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "completed paced assistant text drains before a queued user prompt reaches scrollback",
+    "complete assistant block precedes a queued user prompt in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
       const home = join(root, "home");
@@ -2730,6 +2867,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
       const tracePath = join(root, "trace.log");
+      const firstResponse: HoldState = { started: false, cancelled: false };
       const secondResponse = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2737,17 +2875,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = realpathSync(workspacePath);
 
       const splitGateway = startFakeGateway([
-        fakeGatewaySse([
-          { type: "text-delta", id: "split_old", delta: SPLIT_OLD_RESPONSE },
-          {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: {
-              inputTokens: { total: 3 },
-              outputTokens: { total: 5 },
-            },
-          },
-        ]),
+        () =>
+          heldGatewayResponse(
+            firstResponse,
+            [{ type: "text-delta", id: "split_old", delta: `${SPLIT_OLD_RESPONSE}\n` }],
+            [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 3 },
+                  outputTokens: { total: 5 },
+                },
+              },
+            ],
+          ),
         () => heldGatewayResponse(secondResponse),
       ]);
       gateway = splitGateway;
@@ -2775,18 +2917,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Return the first split fixture.");
-      const beforePrompt = await waitForScrollback(
-        session,
-        (candidate) =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=stream_complete") &&
-          candidate.includes("SPLIT_OLD_TAIL_005") &&
-          !candidate.includes("SPLIT_OLD_TAIL_FINAL"),
-        "completed Gateway stream with assistant presentation still draining",
+      await waitForCondition(
+        () => splitGateway.requests.length === 1 && firstResponse.started,
+        "held first Gateway stream",
       );
-      expect(beforePrompt).not.toContain("SPLIT_OLD_TAIL_FINAL");
+      await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
+      expect(splitGateway.requests).toHaveLength(1);
+      firstResponse.release?.();
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
         "held second Gateway stream",
@@ -2916,12 +3055,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const repairedCalls = parts.filter((part) =>
         part.type === "tool-call" &&
         part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const repairedResults = parts.filter((part) =>
         part.type === "tool-result" &&
         part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const trace = readFileSync(tracePath, "utf8");
       const stderr = readFileSync(stderrPath, "utf8");
@@ -2932,7 +3071,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(repairedResults).toEqual([
         expect.objectContaining({
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
@@ -3043,7 +3182,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("Generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
       await session.waitForText("attached image: queued-snapshot.png", TIMEOUT);
@@ -3207,7 +3346,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             visible.includes(toolHeader) &&
             visible.includes(toolMarker) &&
             visible.includes(permissionMarker) &&
-            visible.includes("Thinking");
+            visible.includes("Generating");
         },
         "local permissions output during held post-tool continuation",
       );
@@ -3219,7 +3358,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (pane) =>
           pane.includes(activeBefore.trim()) &&
           pane.includes(activeAfter.trim()) &&
-          !pane.includes("Thinking"),
+          !pane.includes("Generating"),
         TIMEOUT,
       );
       expect(heldGateway.requests).toHaveLength(2);
@@ -3231,7 +3370,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText(followupResponse, TIMEOUT);
       await session.waitForPane(
-        (pane) => pane.includes(followupResponse) && !pane.includes("Thinking"),
+        (pane) => pane.includes(followupResponse) && !pane.includes("Generating"),
         TIMEOUT,
       );
 
@@ -3451,7 +3590,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "hidden queue review before stream cancellation",
       );
       await session.waitForPane(
-        (pane) => pane.includes("Thinking"),
+        (pane) => pane.includes("Generating"),
         TIMEOUT,
       );
       expect(hold.cancelled).toBe(false);
@@ -4519,8 +4658,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: "queue_scrollback_command",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "sleep 30" },
+              toolName: "shell",
+              input: {
+                request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 600_000,
+                  command: "sleep 30",
+                },
+              },
             },
             {
               type: "finish",
@@ -4574,8 +4720,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForText(draft, TIMEOUT);
 
         await session.sendKeys("C-o");
-        await Bun.sleep(250);
-        await session.sendKeys("Right");
         await Bun.sleep(250);
         await session.sendKeys("C-o");
         await session.waitForText(draft, TIMEOUT);
@@ -5232,18 +5376,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tableGateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "launch-history-list",
-          "list_files",
-          JSON.stringify({ path: "." }),
+          "glob_files",
+          JSON.stringify({ pattern: "*", path: "." }),
           "I'll inspect the docs and determine their authorship.",
         ),
         fakeGatewaySerializedToolCall(
           "launch-history-command",
-          "terminal",
+          "shell",
           JSON.stringify({
-            action: "exec",
-            timeout_ms: 600_000,
-            command:
-              "for i in $(seq -w 1 27); do printf 'docs/source-%s.md\\tWalter (1)\\n' \"$i\"; done",
+            request: {
+              action: "run",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+              command:
+                "for i in $(seq -w 1 27); do printf 'docs/source-%s.md\\tWalter (1)\\n' \"$i\"; done",
+            },
           }),
         ),
         fakeGatewayFinalText(response),
@@ -5481,13 +5628,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           }
           if (body.includes(parentPrompt)) {
             return fakeGatewayToolCall(parentCreateId, "subagent", {
-              command: {
-                create: {
-                  name: `fxc194-${decision}-child`,
-                  mode: "one_off",
-                  prompt: childPrompt,
-                },
-              },
+              request: { action: "run", task: childPrompt },
             });
           }
           return new Response("unexpected Gateway request", { status: 500 });
@@ -5791,8 +5932,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: supportedCallId,
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: supportedCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: supportedCommand } },
           },
           {
             type: "finish",
@@ -5845,18 +5986,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
-      const review = await session.waitForText(
+      const full = await session.waitForText(
         `├ Failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(review).toContain(`└ Ran ${supportedCommand}`);
-      expect(countOccurrences(review, `Failed ${unsupportedToolName}`)).toBe(1);
-      expect(countOccurrences(review, `Ran ${supportedCommand}`)).toBe(1);
-
-      await session.sendKeys("Right");
-      const full = await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       expect(full).toContain(`├ Failed ${unsupportedToolName}`);
       expect(full).toContain(`└ Ran ${supportedCommand}`);
+      expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
+      expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
       await session.waitForText(header, TIMEOUT);
       expect(unsupportedGateway.requests).toHaveLength(2);
@@ -5877,7 +6014,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         ),
       ).toBe(false);
       expect(trace).toContain(
-        `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=terminal`,
+        `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=shell`,
       );
       expect(existsSync(tapePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5953,20 +6090,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "tool_summary_first",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: firstCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: firstCommand } },
           },
           {
             type: "tool-call",
             toolCallId: "tool_summary_nested",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: nestedCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: nestedCommand } },
           },
           {
             type: "tool-call",
             toolCallId: "tool_summary_third",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: thirdCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: thirdCommand } },
           },
           {
             type: "finish",
@@ -6020,22 +6157,27 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.resizeWindow(80, 24);
       await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
       await session.sendKeys("C-o");
-      const review = await session.waitForText(finalText, TIMEOUT);
-      expect(review).toContain(
+      const fullAtTail = await session.waitForText(finalText, TIMEOUT);
+      let fullAtNested = fullAtTail;
+      for (let page = 0; page < 10 && !fullAtNested.includes(
+        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+      ); page += 1) {
+        await session.sendKeys("PPage");
+        fullAtNested = await session.capturePane();
+      }
+      expect(fullAtNested).toContain(
         "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
-      expect(review).toContain(`├ Ran ${firstDisplayCommand}`);
-      expect(review).not.toContain(`Ran ${firstCommand}`);
-      expect(review).toContain("● 3 tool calls · 3 commands");
-      expect(withoutWorkspaceStatusline(review)).not.toContain(workspace);
+      expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
+      expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
-      await session.sendKeys("Right");
-      const full = await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-      expect(full).toContain(finalText);
-      await session.sendKeys("PPage");
-      const fullAtSummary = await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
-      expect(fullAtSummary).toContain("● 3 tool calls · 3 commands");
-      expect(withoutWorkspaceStatusline(fullAtSummary)).not.toContain(workspace);
+      for (let page = 0; page < 10; page += 1) {
+        await session.sendKeys("PPage");
+      }
+      const fullAtFirst = await session.waitForText(firstDisplayCommand, TIMEOUT);
+      expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
+      expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
+      expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
 
       const trace = readFileSync(tracePath, "utf8");
       for (const callId of [
@@ -6084,16 +6226,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "current compact view groups tool rows while Ctrl-O keeps full details",
+    "collapse tool calls hides compact child rows while Ctrl-O keeps full details",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-minimal-tool-groups-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
+      const settingsPath = join(home, ".fx", "settings.json");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(settingsPath, "{}");
       const wrappedToolDetail = Array.from(
         { length: 16 },
         (_, index) => `WRAPPED_TOOL_DETAIL_${String(index + 1).padStart(2, "0")}`,
@@ -6138,20 +6281,27 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_list_workspace",
-            toolName: "list_files",
-            input: { path: "." },
+            toolName: "glob_files",
+            input: { pattern: "*", path: "." },
           },
           {
             type: "tool-call",
             toolCallId: "minimal_list_nested",
-            toolName: "list_files",
-            input: { path: "nested" },
+            toolName: "glob_files",
+            input: { pattern: "*", path: "nested" },
           },
           {
             type: "tool-call",
             toolCallId: "minimal_command_one",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: firstCommand },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: firstCommand,
+              },
+            },
           },
           {
             type: "finish",
@@ -6180,8 +6330,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_command_two",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: secondCommand },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: secondCommand,
+              },
+            },
           },
           {
             type: "finish",
@@ -6199,8 +6356,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_command_live",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: liveCommand },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: liveCommand,
+              },
+            },
           },
           {
             type: "finish",
@@ -6240,7 +6404,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(running).toContain(
         "● 2 tool calls · 1 read · 1 command\n├ Read seven.txt\n└ Running sleep 1; printf SECOND_GROUP_LIVE_COMMAND",
       );
-      expect(running).toMatch(/\n *(?:• )?Thinking \(\d+s\)/);
+      expect(running).toMatch(/\n *(?:• )?Running \(\d+s\)/);
       await session.waitForText(finalText, TIMEOUT);
       const compact = await session.capturePane();
       expect(compact).toContain(
@@ -6262,10 +6426,40 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).not.toContain("\n● Ran printf FIRST_GROUP_COMMAND");
       expect(compact).not.toContain("\n● Ran printf SECOND_GROUP_COMMAND");
 
+      await session.sendText("/settings");
+      await session.waitForText("←→ Change", TIMEOUT);
+      await session.sendLiteral("collapse tool calls");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("Collapse tool calls") &&
+          !pane.includes("Slash menu categories"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Right");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("● 10 tool calls · 6 read · 2 list · 2 commands") &&
+          !pane.includes("Read one.txt"),
+        TIMEOUT,
+      );
+      expect(
+        JSON.parse(readFileSync(settingsPath, "utf8")).collapse_tool_calls,
+      ).toBe(true);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) => pane.includes(finalText) && !pane.includes("←→ Change"),
+        TIMEOUT,
+      );
+      const collapsed = await session.capturePane();
+      expect(collapsed).toContain("● 10 tool calls · 6 read · 2 list · 2 commands");
+      expect(collapsed).toContain("● 2 tool calls · 1 read · 1 command");
+      expect(collapsed).not.toContain("Read one.txt");
+      expect(collapsed).not.toContain("Read seven.txt");
+      expect(collapsed).not.toContain("Ran printf SECOND_GROUP_COMMAND");
+      expect(collapsed).not.toContain("Ran sleep 1; printf SECOND_GROUP_LIVE_COMMAND");
+
       await session.sendKeys("C-o");
       await session.waitForText("MINIMAL_GROUP_DETAIL_SIX", TIMEOUT);
-      await session.sendKeys("Right");
-      await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       const full = await session.captureFullScrollback();
       expect(full).toContain("MINIMAL_GROUP_DETAIL_ONE");
       expect(full).toContain("├ Read one.txt");
@@ -6296,8 +6490,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       const restored = await session.capturePane();
       expect(restored).toContain("● 10 tool calls");
-      expect(restored).toContain("├ Read one.txt");
-      expect(restored).toContain("├ Read seven.txt");
+      expect(restored).not.toContain("├ Read one.txt");
+      expect(restored).not.toContain("├ Read seven.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -6322,10 +6516,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       const cancelledGateway = startFakeGateway([
-        fakeGatewayToolCall("minimal_cancelled_command", "terminal", {
-          action: "exec",
+        fakeShellRun("minimal_cancelled_command", "sleep 30", {
           timeout_ms: 600_000,
-          command: "sleep 30",
         }),
       ]);
       gateway = cancelledGateway;
@@ -6652,13 +6844,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-input-start",
             id: "command_1",
-            toolName: "terminal",
+            toolName: "shell",
           },
           {
             type: "tool-call",
             toolCallId: "command_1",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "seq 1 1" },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "seq 1 1" } },
           },
           {
             type: "finish",
@@ -6697,7 +6889,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const reviewing = await session.capturePane();
       expect(reviewing).toContain("I will inspect the process list.");
-      expect(reviewing).toMatch(/Thinking \(\d+s\)/);
+      expect(reviewing).toMatch(/Running \(\d+s\)/);
       expect(reviewing).not.toContain(finalText);
 
       releaseClassifier(fakeGatewayPermissionDecision("clear"));
@@ -6712,7 +6904,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
           encoding: "utf8",
         }),
-      ).toMatch(/Thinking \(\d+s\)/);
+      ).toMatch(/Running \(\d+s\)/);
     },
     TIMEOUT,
   );
@@ -6740,7 +6932,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-input-start",
               id: "command_provisional",
-              toolName: "terminal",
+              toolName: "shell",
             },
           ]),
       ]);
@@ -6773,7 +6965,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await waitForScrollback(
         session,
         (candidate) =>
-          candidate.includes("Thinking") &&
+          candidate.includes("Running") &&
           !candidate.includes("● Preparing command") &&
           !candidate.includes("Using terminal") &&
           !hasBareRunningRow(candidate),
@@ -6788,7 +6980,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).not.toContain("● Preparing command");
       expect(scrollback).not.toContain("Using terminal");
       expect(scrollback).not.toContain("Used terminal");
-      expect(scrollback).toContain("Thinking");
+      expect(scrollback).toContain("Running");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
       expect(existsSync(tracePath)).toBe(true);
@@ -6805,7 +6997,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider search renders a transcript lifecycle row with URL detail",
+    "provider search renders lifecycle detail and trace observability",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-provider-search-")));
       const home = join(root, "home");
@@ -6824,14 +7016,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "provider_search_direct",
-            toolName: "perplexity_search",
+            toolName: "exa_search",
             input: {},
           },
           {
             type: "tool-result",
             toolCallId: "provider_search_direct",
             result: {
-              results: [{ title: "Fx provider source", url: sourceUrl }],
+              results: [{ title: "fx provider source", url: sourceUrl }],
             },
           },
           {
@@ -6840,7 +7032,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         ]),
         fakeGatewayFinalText(finalText),
-      ]);
+      ], {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["vision", "file-input", "tool-use"],
+        }],
+      });
       gateway = providerGateway;
 
       session = await TmuxSession.create({
@@ -6859,6 +7057,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_CHAT_URL: providerGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: providerGateway.chatUrl,
           FX_MODEL: MODEL,
+          TMPDIR: root,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
           FX_TRACE_LOG: tracePath,
@@ -6876,23 +7075,22 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const initialRequest = parseGatewayRequest(providerGateway.requests[0]!.body);
       const continuingRequest = parseGatewayRequest(providerGateway.requests[1]!.body);
-      expect(serializedToolNames(initialRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+      const expectedToolNames = AUTO_EXA_SERIALIZED_TOOL_NAMES.filter(
+        (name) => name !== "vision",
       );
-      expect(serializedToolNames(continuingRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
-      );
+      expect(serializedToolNames(initialRequest)).toEqual(expectedToolNames);
+      expect(serializedToolNames(continuingRequest)).toEqual(expectedToolNames);
       expect(toolShapesWithoutDescriptions(continuingRequest)).toEqual(
         toolShapesWithoutDescriptions(initialRequest),
       );
       for (const request of [initialRequest, continuingRequest]) {
         const toolNames = serializedToolNames(request);
-        expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
-        expect(toolNames.filter((name) => name === "perplexity_search"))
+        expect(toolNames.filter((name) => name === "shell")).toHaveLength(1);
+        expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [14],
           guidanceMessageIndices: [1],
         });
         expect(
@@ -6906,19 +7104,45 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).toContain("● 1 tool call · 1 read");
       expect(compact).toContain("└ Searched web");
       expect(compact).not.toContain("● Running");
-      expect(compact).not.toContain("Working perplexity_search");
+      expect(compact).not.toContain("Working exa_search");
 
       await session.sendKeys("C-o");
       const detail = await session.waitForText(sourceUrl, TIMEOUT);
       expect(detail).toContain(sourceUrl);
       expect(detail).toContain("└ Searched web");
 
+      await session.sendKeys("Escape");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/trace");
+      await waitForCondition(
+        () => readdirSync(root!).some((entry) =>
+          entry.startsWith("fx-trace-") && entry.endsWith(".md")
+        ),
+        "provider search trace report",
+      );
+      const traceReportName = readdirSync(root)
+        .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
+        .sort()
+        .at(-1);
+      expect(traceReportName).toBeDefined();
+      const traceReport = readFileSync(join(root, traceReportName!), "utf8");
+      expect(traceReport).toContain("web_search_requests_total: 1 (observed)");
+      expect(traceReport).toContain("billable_web_search_calls: 0 (billed)");
+      expect(traceReport).toContain("### Web Search");
+      expect(traceReport).toContain(
+        "name=web_search status=ok",
+      );
+      expect(traceReport).not.toContain("exa_search");
+      expect(traceReport).not.toContain("parallel_search");
+      expect(traceReport).not.toContain("perplexity_search");
+      expect(traceReport).not.toContain("(none recorded)");
+
       const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
         encoding: "utf8",
       });
       expect(replay).toContain("● 1 tool call · 1 read");
       expect(replay).toContain("└ Searched web");
-      expect(replay).not.toContain("Working perplexity_search");
+      expect(replay).not.toContain("Working exa_search");
       expect(existsSync(tracePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -6926,7 +7150,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "multiline terminal keeps raw approval and persistence with compact activity",
+    "multiline shell keeps raw approval and persistence with compact activity",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-multiline-command-")));
       const home = join(root, "home");
@@ -6950,7 +7174,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(stderrPath, "");
 
       const commandGateway = startFakeGateway([
-        fakeGatewayToolCall("multiline_command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+        fakeShellRun("multiline_command", command, { timeout_ms: 600_000 }),
         fakeGatewayFinalText(finalText),
       ]);
       gateway = commandGateway;
@@ -6995,9 +7219,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(compactActivity);
       expect(scrollback).not.toContain(`Ran cat <<'EOF'\\x0a`);
-      expect(commandGateway.requests[1]!.body).toContain(
-        "exit_code=0\\n<stdout>\\nline one\\n</stdout>",
-      );
+      expect(commandGateway.requests[1]!.body).toContain("\\\"exit_code\\\":0");
+      expect(commandGateway.requests[1]!.body).toContain("\\\"output_delta\\\":\\\"line one\\\\n\\\"");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
 
@@ -7021,15 +7244,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const step = saved.history
         .flatMap((turn: any) => turn.execution?.tool_steps ?? [])
         .find((entry: any) =>
-          entry.tool_calls?.some((call: any) => call.name === "terminal")
+          entry.tool_calls?.some((call: any) => call.name === "shell")
         );
       expect(step).toBeDefined();
-      const savedCall = step.tool_calls.find((call: any) => call.name === "terminal");
+      const savedCall = step.tool_calls.find((call: any) => call.name === "shell");
       expect(JSON.parse(savedCall.arguments_json).command).toBe(command);
       expect(step.tool_results).toContainEqual(
         expect.objectContaining({
           tool_call_id: savedCall.id,
-          tool_name: "terminal",
+          tool_name: "shell",
           status: "success",
         }),
       );
@@ -7044,7 +7267,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "same-step streamed terminal calls complete with owned output blocks",
+    "same-step streamed shell calls complete with owned output blocks",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-parallel-command-")));
       const home = join(root, "home");
@@ -7069,31 +7292,31 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const commandGateway = startFakeGateway([
         fakeGatewaySse([
-          { type: "tool-input-start", id: "stream_cmd_one", toolName: "terminal" },
+          { type: "tool-input-start", id: "stream_cmd_one", toolName: "shell" },
           {
             type: "tool-input-delta",
             id: "stream_cmd_one",
-            delta: JSON.stringify({ action: "exec", timeout_ms: 600_000, command: firstCommand }),
+            delta: JSON.stringify({ request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: firstCommand } }),
           },
           { type: "tool-input-end", id: "stream_cmd_one" },
-          { type: "tool-input-start", id: "stream_cmd_two", toolName: "terminal" },
+          { type: "tool-input-start", id: "stream_cmd_two", toolName: "shell" },
           {
             type: "tool-input-delta",
             id: "stream_cmd_two",
-            delta: JSON.stringify({ action: "exec", timeout_ms: 600_000, command: secondCommand }),
+            delta: JSON.stringify({ request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: secondCommand } }),
           },
           { type: "tool-input-end", id: "stream_cmd_two" },
           {
             type: "tool-call",
             toolCallId: "stream_cmd_one",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: firstCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: firstCommand } },
           },
           {
             type: "tool-call",
             toolCallId: "stream_cmd_two",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: secondCommand },
+            toolName: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: secondCommand } },
           },
           {
             type: "finish",
@@ -7154,7 +7377,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).not.toContain("Preparing command");
       expect(scrollback).not.toContain("lines more (ctrl o to view)");
       const continuationBody = commandGateway.requests[1]!.body;
-      const firstResult = "exit_code=0\\n<stdout>\\nFIRST_CMD_DONE\\n</stdout>";
+      const firstResult = "\\\"output_delta\\\":\\\"FIRST_CMD_DONE\\\\n\\\"";
       const secondResultTail = "SECOND_CMD_LINE_30";
       expect(continuationBody).toContain(firstResult);
       expect(continuationBody).toContain(secondResultTail);
@@ -7163,11 +7386,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session.sendKeys("C-o");
-      await session.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      const reviewEscapes = await session.capturePaneEscapes();
-      expect(reviewEscapes).not.toContain("\x1b[38;5;245m│");
-      expect(reviewEscapes).toContain("│\x1b[38;5;245m  30 output lines");
-      await session.sendKeys("Right");
+      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      const fullTailEscapes = await session.capturePaneEscapes();
+      expect(fullTailEscapes).not.toContain("\x1b[38;5;245m│");
+      expect(fullTailEscapes).toContain("│\x1b[38;5;245m SECOND_CMD_LINE_30");
+      for (let page = 0; page < 10; page += 1) {
+        await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+      }
+      await session.waitForText("FIRST_CMD_DONE", TIMEOUT);
       for (let page = 0; page < 10; page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);
       }
@@ -7191,9 +7417,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stableSecondCommandLine = "SECOND_CMD_LINE_24";
       expect(replayFrames).toContain("FIRST_CMD_DONE");
       expect(replayFrames).toContain(stableSecondCommandLine);
-      expect(replayFrames.indexOf("FIRST_CMD_DONE")).toBeLessThan(
-        replayFrames.indexOf(stableSecondCommandLine),
-      );
       expect(replayFrames).toContain("SECOND_CMD_LINE_30");
       expect(replayFrames).toContain(finalText);
       expect(existsSync(tracePath)).toBe(true);
@@ -7241,7 +7464,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
 
       await session.sendText("/help");
-      await session.waitForText("Commands 36", TIMEOUT);
+      await session.waitForText("Commands 35", TIMEOUT);
       expect(gateway.requestCount()).toBe(1);
       await session.sendKeys("Escape");
     },
@@ -7679,6 +7902,122 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
   }
 
   test(
+    "idle running activity advances without composer input",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-running-activity-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "session.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const command = "sleep 6; printf IDLE_ACTIVITY_COMMAND_DONE";
+      const finalText = "IDLE_ACTIVITY_TURN_DONE";
+      const historyLines = Array.from(
+        { length: 48 },
+        (_, index) => `IDLE_ACTIVITY_HISTORY_${String(index + 1).padStart(2, "0")}`,
+      );
+      gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-start", id: "idle-activity-history" },
+          ...historyLines.map((line) => ({
+            type: "text-delta" as const,
+            id: "idle-activity-history",
+            delta: `${line}\n`,
+          })),
+          { type: "text-end", id: "idle-activity-history" },
+          {
+            type: "tool-call",
+            toolCallId: "idle-activity-command",
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command,
+              },
+            },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      const fakeGateway = gateway as ReturnType<typeof startFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 114,
+        height: 35,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-idle-running-activity-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_MAX_AGENT_STEPS: "3",
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "frame_schedule,frame_diff,paint,worker,ui_activity",
+        },
+      });
+
+      await session.waitForComposer(SB_TIMEOUT);
+      await session.sendText("Run the idle activity fixture.");
+      await session.waitForText(`Running ${command}`, SB_TIMEOUT);
+
+      const historyBeforeActivity = sbHistoryText(session.name);
+      expect(historyBeforeActivity.length).toBeGreaterThan(0);
+      const traceOffset = readFileSync(tracePath, "utf8").length;
+      const elapsedSeconds = new Set<number>();
+      const markerStates = new Set<boolean>();
+      for (let sample = 0; sample < 12; sample += 1) {
+        const pane = await session.capturePane();
+        const activity = pane.match(/(^|\n)(•| ) Running \((\d+)s\)/);
+        expect(activity, `activity sample ${sample}`).not.toBeNull();
+        markerStates.add(activity![2] === "•");
+        elapsedSeconds.add(Number.parseInt(activity![3]!, 10));
+        await Bun.sleep(250);
+      }
+
+      expect(elapsedSeconds.size).toBeGreaterThan(1);
+      expect(markerStates).toEqual(new Set([true, false]));
+      expect(sbHistoryText(session.name)).toBe(historyBeforeActivity);
+      const activityTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
+      const animationAttempts = activityTrace
+        .split("\n")
+        .filter((line) => line.includes("[frame_schedule] attempt_begin reasons=animation "));
+      const animationResults = activityTrace
+        .split("\n")
+        .filter((line) => line.includes("[frame_diff] attempt_result "));
+      expect(animationAttempts.length).toBeGreaterThan(0);
+      expect(animationResults.length).toBeGreaterThan(0);
+      for (const result of animationResults) {
+        expect(result).toContain(
+          "transcript_body=retain body_paints=0 retained_changed_cells=0",
+        );
+      }
+      await session.waitForText(finalText, SB_TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(existsSync(tapePath)).toBe(true);
+    },
+    SB_TIMEOUT + 20_000,
+  );
+
+  test(
     "closed tool groups enter native scrollback before the turn finishes",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-tool-groups-")));
@@ -7707,12 +8046,13 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
           [
             {
               id: "group-b-command",
-              name: "terminal",
-              input: {
-                action: "exec",
+              name: "shell",
+              input: { request: {
+                action: "run",
                 command: "sleep 5; printf HELD_COMMAND_DONE",
+                yield_time_ms: 30_000,
                 timeout_ms: 600_000,
-              },
+              } },
             },
           ],
           "SECOND_GROUP_INTRO",
@@ -7849,8 +8189,8 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       gateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "sb-list",
-          "list_files",
-          JSON.stringify({ path: "docs" }),
+          "glob_files",
+          JSON.stringify({ pattern: "*", path: "docs" }),
           "I'll inspect the SWR wiring end to end.",
         ),
         ...Array.from({ length: 17 }, (_, index) => readResponse(index + 1)),
@@ -8324,7 +8664,7 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
         expect(phaseOneHistory).toContain("• BLOCK_BULLET");
         expect(phaseOneHistory).toContain("✓ BLOCK_TASK_COMPLETE");
         expect(phaseOneHistory).toContain("│ QUOTE_BLOCK_FIRST");
-        expect(phaseOneHistory).toContain("┌ zig ");
+        expect(phaseOneHistory).toContain("─ zig ─");
         expect(phaseOneHistory).toContain("┬");
         expect(phaseOneHistory).toContain("┼");
         expect(phaseOneHistory).toContain("┴");

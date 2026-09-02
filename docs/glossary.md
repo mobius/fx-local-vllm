@@ -111,3 +111,6 @@
 | terminal outcome integrity | 终端结果完整性；即使执行或恢复路径发生异常，也保留终端的最终状态和输出语义。 |
 | rapid-exit handoff | 快速退出交接；进程即将退出时，把恢复所需的 session、shell 或 terminal 状态交给后续执行者。 |
 | terminal transcript lineage | 终端 transcript 谱系；记录终端输出片段与 session、恢复和子 agent 来源之间的关系。 |
+| ZON / `std.zon` | Zig Object Notation 及其标准库实现；本轮上游 benchmark 在 Windows Zig 0.16 测试编译中触发了标准库文件加载问题。 |
+| error set | Zig 错误集合；函数签名允许返回的错误类型集合，平台分支新增错误时需要确保集合能够承载它。 |
+| independent build cache | 独立构建缓存；为排查缓存污染或编译器状态问题而使用的项目内临时 cache，不使用全局 cache。 |

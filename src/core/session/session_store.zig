@@ -1319,7 +1319,7 @@ pub const Store = struct {
             alloc,
             workspace_root,
             options,
-        ) orelse return error.NoSavedSessions;
+        ) orelse return session_log.failLoadedWritableSession(error.NoSavedSessions);
         defer alloc.free(selected);
         var loaded = try self.resumeExactForWrite(
             alloc,
@@ -3245,7 +3245,9 @@ pub const Store = struct {
         if (std.mem.eql(u8, loaded.state.workspace_root, workspace_root)) {
             return loaded;
         }
-        if (!allow_rebind) return error.SessionTargetChanged;
+        if (!allow_rebind) {
+            return session_log.failLoadedWritableSession(error.SessionTargetChanged);
+        }
 
         const rebound = session_event.Event{ .workspace_rebound = .{
             .previous_workspace_root = loaded.state.workspace_root,
@@ -3258,7 +3260,7 @@ pub const Store = struct {
             .rollback_before_adapter_continue,
             options.log,
         ) catch |err| switch (err) {
-            error.SessionPersistenceDegraded => return error.SessionWorkspaceRebindFailed,
+            error.SessionPersistenceDegraded => return session_log.failLoadedWritableSession(error.SessionWorkspaceRebindFailed),
             else => return err,
         };
         return loaded;
@@ -4241,7 +4243,6 @@ fn copyRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4280,7 +4281,6 @@ fn rebaseRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4312,7 +4312,6 @@ fn copyRecoveredManagedChildren(
         const execution = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| &entry.execution,
-            .background_command => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
         };
         for (execution.tool_steps) |*step| {
@@ -4618,7 +4617,6 @@ fn resolveSessionSnapshotLocators(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4639,13 +4637,11 @@ fn deleteSnapshotFilesAddedByMigration(
         const candidate_images = switch (candidate_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
-            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         const original_images = switch (original_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
-            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         image_attachments.deleteUnreferencedImageSnapshots(
@@ -8792,12 +8788,12 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
 
     var calls = [_]session.ToolCall{.{
         .id = @constCast("persisted_duplicate_call"),
-        .name = @constCast("list_files"),
+        .name = @constCast("glob_files"),
         .arguments_json = @constCast(duplicate_arguments),
     }};
     var results = [_]session.PersistedToolResult{.{
         .tool_call_id = @constCast("persisted_duplicate_call"),
-        .tool_name = @constCast("list_files"),
+        .tool_name = @constCast("glob_files"),
         .status = .success,
         .output = @constCast("stale success"),
         .output_bytes = 13,
@@ -13764,12 +13760,9 @@ test "history page preserves specialized canonical turns and deep-copy ownership
             .assistant = @constCast("assistant λ"),
             .execution = .{ .tool_steps = &steps },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("background") },
-            .assistant = @constCast("started"),
-            .log_path = @constCast("/tmp/background.log"),
-            .expect_url = true,
-            .url = @constCast("https://example.test"),
+            .assistant = @constCast("historical command"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("interrupted") },
@@ -13788,7 +13781,7 @@ test "history page preserves specialized canonical turns and deep-copy ownership
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), first.turns.len);
     try std.testing.expectEqualStrings("tool output", first.turns[0].assistant.execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("/tmp/background.log", first.turns[1].background_command.log_path);
+    try std.testing.expectEqualStrings("historical command", first.turns[1].assistant.assistant);
     try std.testing.expectEqualStrings("partial", first.turns[2].interrupted.assistant.?);
     try std.testing.expectEqualStrings("compacted λ", first.turns[3].compacted_summary.summary);
     first.turns[0].assistant.assistant[0] = 'X';

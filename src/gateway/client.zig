@@ -1190,6 +1190,12 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
         const name = tool.object.get("name") orelse continue;
         if (tool_type != .string or id != .string or name != .string) continue;
         if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, id.string, "gateway.exa_search") and
+            std.mem.eql(u8, name.string, "exa_search"))
+        {
+            return "exa_search";
+        }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
             std.mem.eql(u8, id.string, "gateway.perplexity_search") and
             std.mem.eql(u8, name.string, "perplexity_search"))
         {
@@ -1206,15 +1212,31 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
 }
 
 test "expected provider tool name only trusts advertised provider schemas" {
-    const direct_payload =
-        \\{"tools":[{"type":"provider","id":"gateway.perplexity_search","name":"perplexity_search"}]}
-    ;
-    const expected = try expectedProviderToolName(std.testing.allocator, direct_payload);
-    try std.testing.expect(expected != null);
-    try std.testing.expectEqualStrings("perplexity_search", expected.?);
+    const cases = [_]struct {
+        payload: []const u8,
+        name: []const u8,
+    }{
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\"}]}",
+            .name = "exa_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\"}]}",
+            .name = "perplexity_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.parallel_search\",\"name\":\"parallel_search\"}]}",
+            .name = "parallel_search",
+        },
+    };
+    for (cases) |case| {
+        const expected = try expectedProviderToolName(std.testing.allocator, case.payload);
+        try std.testing.expect(expected != null);
+        try std.testing.expectEqualStrings(case.name, expected.?);
+    }
 
     const prompt_only_payload =
-        \\{"prompt":"call gateway.perplexity_search with name perplexity_search","tools":[]}
+        \\{"prompt":"call gateway.exa_search with name exa_search","tools":[]}
     ;
     try std.testing.expect((try expectedProviderToolName(std.testing.allocator, prompt_only_payload)) == null);
 }
@@ -1355,8 +1377,8 @@ fn streamGatewayCompletionCoreWithOptions(
         else
             .definitely_unsent;
 
-        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} retry_count={d}", .{ attempt + 1, retry_count });
-        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} retry_count={d} payload_bytes={d}", .{ attempt + 1, retry_count, payload.len });
+        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
+        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
         var req = openGatewayRequestBounded(&client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
@@ -4900,7 +4922,7 @@ test "consumeSseStream rejects a final tool name that conflicts with streamed id
             "data: {{\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{{\\\"path\\\":\\\"victim.txt\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"A\"}}\n\n" ++
-                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"delete_file\"{s}}}\n\n" ++
+                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"edit_file\"{s}}}\n\n" ++
                 "data: [DONE]\n\n",
             .{final_input},
         );
@@ -6275,6 +6297,67 @@ test "transport-owned TLS setup retries before send" {
 
     try std.testing.expectEqual(@as(usize, 2), probe.attempts);
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "gateway setup trace distinguishes attempt limits from retries used" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "gateway-attempts.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "gateway");
+
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        alloc,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 2,
+            .chat_url = harness.url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    defer result.deinit(alloc);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "attempt=1 attempt_limit=2 retries_used=0",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "attempt=2 attempt_limit=2 retries_used=1",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, trace, "retry_count=") == null);
+
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }

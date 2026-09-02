@@ -1,4 +1,5 @@
 const std = @import("std");
+const managed_execution = @import("../execution/managed_execution.zig");
 const builtin = @import("builtin");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -23,7 +24,6 @@ const session_store = @import("../session/session_store.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tooling_tool_admission = @import("../tooling/tool_admission.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
-const background_runtime = @import("../background/background_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
 const control_store = @import("control_store.zig");
@@ -529,6 +529,7 @@ pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
     worker: worker_runtime.WorkerRuntime = .{},
+    managed_executions: managed_execution.Runtime,
     loaded: *session_store.LoadedWritableSession,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
@@ -553,11 +554,17 @@ pub const TurnContext = struct {
             loaded.state.context_history_start,
             loaded.state.permission_state,
         );
-        return .{ .alloc = alloc, .runtime = runtime, .loaded = loaded };
+        return .{
+            .alloc = alloc,
+            .runtime = runtime,
+            .managed_executions = managed_execution.Runtime.init(alloc),
+            .loaded = loaded,
+        };
     }
 
     fn deinit(self: *TurnContext) void {
         if (self.failure_diagnostic) |diagnostic| self.alloc.free(diagnostic);
+        self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
         self.* = undefined;
@@ -609,6 +616,12 @@ pub const TurnContext = struct {
 
     pub fn workerRuntime(self: *TurnContext) *worker_runtime.WorkerRuntime {
         return &self.worker;
+    }
+
+    pub fn managedExecutionRuntime(
+        self: *TurnContext,
+    ) *managed_execution.Runtime {
+        return &self.managed_executions;
     }
 
     /// Presentation-only output. Allocation pressure never changes execution
@@ -1259,7 +1272,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         .clear_route_recovery_status,
         .route_recovery_status,
         .turn_token_update,
-        .tool_payload_started,
+        .turn_phase_update,
         => 1,
         .semantic_notice, .error_text => |notice| notice.topic.len +| notice.body.len,
         .command_output => |chunk| chunk.text.len +|
@@ -2294,7 +2307,7 @@ pub const Owner = struct {
             "terminal reconciliation deferred child_id={s} outcome={s}",
             .{ child_id, @errorName(err) },
         );
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -2417,7 +2430,7 @@ pub const Owner = struct {
             communication_state,
             record,
         ) catch return error.ControlStoreFailed;
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -2658,7 +2671,7 @@ pub const Owner = struct {
             .capability = &communication_capability,
             .expected_session_id = child_id,
         };
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -3196,7 +3209,7 @@ fn runOne(slot: *Slot) OneResult {
         communication_state,
         record,
     ) catch return .control_failed;
-    _ = reconcileOneOffFinalResultLocked(
+    _ = reconcileFinalResultLocked(
         owner.alloc,
         communication_state,
         record,
@@ -3344,7 +3357,7 @@ fn runOne(slot: *Slot) OneResult {
         owner.wakeNotificationSchedules(slot.child_id, completed_at_ms);
         return .control_failed;
     };
-    _ = reconcileOneOffFinalResultLocked(
+    _ = reconcileFinalResultLocked(
         owner.alloc,
         communication_state,
         current,
@@ -3428,7 +3441,6 @@ fn reconcileToolActivityLocked(
 fn historyExecution(turn: types.HistoryTurn) ?types.ExecutionMemory {
     return switch (turn) {
         .assistant => |value| value.execution,
-        .background_command => |value| value.execution,
         .interrupted => |value| value.execution,
         .compacted_summary => null,
     };
@@ -3485,7 +3497,6 @@ fn assistantTextForWork(
         if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
         return switch (candidate) {
             .assistant => |value| value.assistant,
-            .background_command => |value| value.assistant orelse "",
             .interrupted => |value| value.assistant orelse "",
             .compacted_summary => null,
         };
@@ -3514,37 +3525,44 @@ fn boundedFinalResultAlloc(
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
 }
 
-fn oneOffFinalResultAlloc(
+fn finalResultAlloc(
     alloc: Allocator,
+    mode: domain.Mode,
     work: domain.QueuedMessage,
     transition: TerminalTransition,
     history: []const types.HistoryTurn,
 ) (Allocator.Error || error{InvalidRecord})![]u8 {
-    const fallback_completed = "One-off subagent completed without a final text response.";
+    const subject = if (mode == .one_off) "One-off subagent" else "Subagent";
     var formatted: ?[]u8 = null;
     defer if (formatted) |value| alloc.free(value);
     const raw = switch (work.status) {
         .completed => blk: {
             const assistant = assistantTextForWork(history, work.id) orelse
-                fallback_completed;
+                "";
             break :blk if (assistant.len != 0 and text_utils.isModelSafeText(assistant))
                 assistant
-            else
-                fallback_completed;
+            else fallback: {
+                formatted = try std.fmt.allocPrint(
+                    alloc,
+                    "{s} completed without a final text response.",
+                    .{subject},
+                );
+                break :fallback formatted.?;
+            };
         },
         .failed => blk: {
             formatted = try std.fmt.allocPrint(
                 alloc,
-                "One-off subagent failed: {s}",
-                .{transition.reason orelse "unknown failure"},
+                "{s} failed: {s}",
+                .{ subject, transition.reason orelse "unknown failure" },
             );
             break :blk formatted.?;
         },
         .cancelled => blk: {
             formatted = try std.fmt.allocPrint(
                 alloc,
-                "One-off subagent cancelled: {s}",
-                .{work.cancellation_reason orelse transition.reason orelse "cancelled"},
+                "{s} cancelled: {s}",
+                .{ subject, work.cancellation_reason orelse transition.reason orelse "cancelled" },
             );
             break :blk formatted.?;
         },
@@ -3553,13 +3571,13 @@ fn oneOffFinalResultAlloc(
     return boundedFinalResultAlloc(alloc, raw);
 }
 
-fn reconcileOneOffFinalResultLocked(
+fn reconcileFinalResultLocked(
     alloc: Allocator,
     store: communication_store.Store,
     record: control_store.Record,
     history: []const types.HistoryTurn,
 ) communication_manager.Error!bool {
-    if (record.mode != .one_off) return false;
+    if (!shouldReconcileFinalResult(record)) return false;
     var index = record.queue.len;
     while (index > 0) {
         index -= 1;
@@ -3574,8 +3592,9 @@ fn reconcileOneOffFinalResultLocked(
             work.id,
             work.status,
         ) orelse return error.InvalidRecord;
-        const content = oneOffFinalResultAlloc(
+        const content = finalResultAlloc(
             alloc,
+            record.mode,
             work,
             transition,
             history,
@@ -3591,6 +3610,16 @@ fn reconcileOneOffFinalResultLocked(
             .timestamp_ms = transition.timestamp_ms,
             .content = content,
         });
+    }
+    return false;
+}
+
+fn shouldReconcileFinalResult(record: control_store.Record) bool {
+    if (record.mode == .one_off) return true;
+    for (record.operations) |operation| {
+        if (operation.code == .created and operation.identity_source == .model) {
+            return true;
+        }
     }
     return false;
 }
@@ -3648,7 +3677,7 @@ test "one off terminal results and retry classification stay bounded" {
         .status = .failed,
         .created_at_ms = 1,
     };
-    const failed_result = try oneOffFinalResultAlloc(alloc, failed, transition, &.{});
+    const failed_result = try finalResultAlloc(alloc, .one_off, failed, transition, &.{});
     defer alloc.free(failed_result);
     try std.testing.expectEqualStrings(
         "One-off subagent failed: provider_failed",
@@ -3663,8 +3692,9 @@ test "one off terminal results and retry classification stay bounded" {
         .cancellation_reason = @constCast("user cancelled"),
         .created_at_ms = 1,
     };
-    const cancelled_result = try oneOffFinalResultAlloc(
+    const cancelled_result = try finalResultAlloc(
         alloc,
+        .one_off,
         cancelled,
         .{ .timestamp_ms = 2, .reason = "user cancelled" },
         &.{},
@@ -3689,8 +3719,9 @@ test "one off terminal results and retry classification stay bounded" {
         .status = .completed,
         .created_at_ms = 1,
     };
-    const completed_result = try oneOffFinalResultAlloc(
+    const completed_result = try finalResultAlloc(
         alloc,
+        .one_off,
         completed,
         .{ .timestamp_ms = 2, .reason = null },
         &history,
@@ -4381,7 +4412,7 @@ const ApprovalBlockingExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .tool_names = &.{"create_folder"},
+            .tool_names = &.{"write_file"},
             .rules = .{ .rules = &.{} },
             .grants = &.{},
             .integration_names = &.{},
@@ -4411,13 +4442,13 @@ const ApprovalBlockingExecution = struct {
         var response = turn.permissionPrompter().request(
             turn.alloc,
             .{
-                .label = "create_folder blocked",
-                .command = "mkdir blocked",
+                .label = "write_file blocked",
+                .command = "write blocked",
             },
             .{
                 .id = "approval-blocked-call",
-                .name = "create_folder",
-                .arguments_json = "{\"path\":\"blocked\"}",
+                .name = "write_file",
+                .arguments_json = "{\"path\":\"blocked\",\"content\":\"\"}",
             },
             null,
             null,
@@ -6592,8 +6623,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
     var initial_authority = try turn.resolveLiveAuthority(alloc);
     const initial_authority_generation = initial_authority.generation;
     initial_authority.deinit(alloc);
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("bash"),
         .pattern = @constCast("*"),
@@ -6615,8 +6644,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
                 arena_state.allocator(),
                 .{
                     .id = "canonical-call",
-                    .name = "terminal",
-                    .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
+                    .name = "shell",
+                    .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}",
                 },
                 .auto,
                 &.{},
@@ -6656,10 +6685,9 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{ .rules = &rules },
-        .tool_registry = .{ .tools = &.{test_builtin_tools.terminal} },
+        .tool_registry = .{ .tools = &.{test_builtin_tools.shell} },
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
-        .background = &background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     }, .start = &registration_start, .ready = &registration_ready };
@@ -6799,8 +6827,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         refreshed_arena.allocator(),
         .{
             .id = "canonical-call",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}",
         },
         "/tmp/workspace",
         "/tmp/workspace",
@@ -6888,7 +6916,7 @@ const ToolEffectExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .tool_names = &.{"create_folder"},
+            .tool_names = &.{"write_file"},
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AdmissionFailed,
@@ -6904,12 +6932,13 @@ const ToolEffectExecution = struct {
     ) ServiceError!RunOutcome {
         const self: *ToolEffectExecution = @ptrCast(@alignCast(raw.?));
         const recorder = turn.toolActivityRecorder();
-        recorder.record("effect-call", "create_folder", .started) catch
+        recorder.record("effect-call", "write_file", .started) catch
             return error.ProviderFailed;
-        self.dir.createDirPath(io_mod.getIo(), "effect") catch
+        var file = self.dir.createFile(io_mod.getIo(), "effect", .{ .truncate = true }) catch
             return error.ProviderFailed;
+        file.close(io_mod.getIo());
         _ = self.effects.fetchAdd(1, .seq_cst);
-        recorder.record("effect-call", "create_folder", .succeeded) catch {};
+        recorder.record("effect-call", "write_file", .succeeded) catch {};
 
         var history_turn = session.makeAssistantTurn(
             turn.alloc,
@@ -6919,12 +6948,12 @@ const ToolEffectExecution = struct {
         defer session.freeHistoryTurn(turn.alloc, history_turn);
         const calls = [_]types.ToolCall{.{
             .id = "effect-call",
-            .name = "create_folder",
-            .arguments_json = "{\"path\":\"effect\"}",
+            .name = "write_file",
+            .arguments_json = "{\"path\":\"effect\",\"content\":\"\"}",
         }};
         const results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("effect-call"),
-            .tool_name = @constCast("create_folder"),
+            .tool_name = @constCast("write_file"),
             .status = .success,
             .output = @constCast("created"),
             .output_bytes = 7,
@@ -6953,7 +6982,7 @@ const ToolEffectAuthority = struct {
         alloc: Allocator,
         _: []const u8,
     ) !authority_mod.HostAuthority {
-        const tools = try cloneTestStrings(alloc, &.{"create_folder"});
+        const tools = try cloneTestStrings(alloc, &.{"write_file"});
         errdefer freeTestStrings(alloc, tools);
         const integrations = try alloc.alloc([]u8, 0);
         errdefer alloc.free(integrations);
@@ -7968,180 +7997,6 @@ test "owner deinit joins and preserves unfinished durable work for recovery" {
     resumed.deinit(alloc);
 }
 
-fn ownLiveRevalidationRule(
-    alloc: Allocator,
-    permission: []const u8,
-    pattern: []const u8,
-    action: types.PermissionAction,
-) !types.PermissionRule {
-    const owned_permission = try alloc.dupe(u8, permission);
-    errdefer alloc.free(owned_permission);
-    return .{
-        .permission = owned_permission,
-        .pattern = try alloc.dupe(u8, pattern),
-        .action = action,
-    };
-}
-
-const LiveRevalidationHost = struct {
-    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
-    changed_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    tool_name: []const u8,
-    source_pattern: ?[]const u8 = null,
-    destination_pattern: ?[]const u8 = null,
-
-    fn action(code: u8) ?types.PermissionAction {
-        return switch (code) {
-            0 => null,
-            1 => .ask,
-            2 => .deny,
-            else => unreachable,
-        };
-    }
-
-    fn change(self: *@This(), next: types.PermissionAction) void {
-        self.changed_action.store(switch (next) {
-            .ask => 1,
-            .deny => 2,
-            .allow => unreachable,
-        }, .seq_cst);
-        self.generation.store(2, .seq_cst);
-    }
-
-    fn resolve(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        _: []const u8,
-    ) authority_mod.HostResolveError!authority_mod.HostAuthority {
-        const self: *@This() = @ptrCast(@alignCast(raw.?));
-        const generation = self.generation.load(.seq_cst);
-        const changed_action = if (generation == 1)
-            null
-        else
-            action(self.changed_action.load(.seq_cst));
-        const rule_count: usize = @as(usize, @intFromBool(self.source_pattern != null)) +
-            @as(usize, @intFromBool(changed_action != null));
-        const rules = try alloc.alloc(types.PermissionRule, rule_count);
-        errdefer alloc.free(rules);
-        var initialized: usize = 0;
-        errdefer for (rules[0..initialized]) |rule| {
-            alloc.free(rule.permission);
-            alloc.free(rule.pattern);
-        };
-
-        if (self.source_pattern) |source| {
-            rules[initialized] = try ownLiveRevalidationRule(
-                alloc,
-                self.tool_name,
-                source,
-                .allow,
-            );
-            initialized += 1;
-        }
-        if (changed_action) |value| {
-            rules[initialized] = try ownLiveRevalidationRule(
-                alloc,
-                self.tool_name,
-                self.destination_pattern.?,
-                value,
-            );
-            initialized += 1;
-        }
-
-        const tools = try cloneTestStrings(alloc, &.{self.tool_name});
-        errdefer freeTestStrings(alloc, tools);
-        const integrations = try alloc.alloc([]u8, 0);
-        errdefer alloc.free(integrations);
-        const grants = try alloc.alloc(types.PermissionGrant, 0);
-        errdefer types.freePermissionGrantSlice(alloc, grants);
-        return .{
-            .generation = generation,
-            .tools = tools,
-            .integrations = integrations,
-            .rules = .{ .rules = rules },
-            .grants = grants,
-        };
-    }
-};
-
-const ProductionPermissionAdapter = struct {
-    turn: *TurnContext,
-    background: *background_runtime.BackgroundRuntime,
-    workspace_root: []const u8,
-    tool_registry: tool_dispatch.Registry,
-
-    fn input(
-        self: *@This(),
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-    ) !tooling_tool_admission.Input {
-        const authority = live_authority orelse return error.HostAuthorityUnavailable;
-        return .{
-            .workspace_root = self.workspace_root,
-            .permission_review_turn = review_turn,
-            .permission_grants = authority.grants,
-            .permission_rules = authority.rules,
-            .tool_registry = self.tool_registry,
-            .worker = &self.turn.worker,
-            .permission_prompter = self.turn.permissionPrompter(),
-            .background = self.background,
-            .advertised_dynamic_tool_names = &.{},
-            .mcp_runtime = .{},
-        };
-    }
-
-    fn requestPermission(
-        raw: *anyopaque,
-        arena: Allocator,
-        call: types.ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: types.PermissionMode,
-        local_grants: []const types.PermissionGrant,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-        revalidation: ?agent_runtime.LivePermissionRevalidation,
-        _: []const []const u8,
-    ) !command_admission.PermissionOutcome {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        const admission = try self.input(review_turn, live_authority);
-        return if (revalidation) |request| switch (request) {
-            .action => |action_request| tooling_tool_admission.revalidateLiveActionPermissionOutcome(
-                admission,
-                arena,
-                call,
-                permission_mode,
-                local_grants,
-                action_request.authority,
-                action_request.human_approval,
-            ),
-        } else tooling_tool_admission.requestPermissionOutcome(
-            admission,
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-        );
-    }
-};
-
-const ProductionPromptThread = struct {
-    gateway: *agent_test_support.FakeGateway,
-    hooks: *agent_test_support.FakeAgentRuntimeDeps,
-    config: agent_runtime.Config,
-    job: worker_runtime.QueuedPrompt,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn run(self: *@This()) void {
-        defer self.finished.store(true, .seq_cst);
-        agent_test_support.runFakePrompt(
-            self.gateway,
-            self.hooks,
-            self.config,
-            self.job,
-        ) catch self.failed.store(true, .seq_cst);
-    }
-};
-
 fn waitForPendingToolApproval(
     alloc: Allocator,
     env: *TestEnvironment,
@@ -8245,207 +8100,6 @@ fn waitForObservedToolApproval(
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
     return error.TestApprovalNotRegistered;
-}
-
-fn runProductionActionGenerationCase(
-    tool_name: []const u8,
-    changed_action: types.PermissionAction,
-    approval_decision: types.ToolPermissionDecision,
-) !void {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "permission-child");
-    try env.installControl(
-        alloc,
-        "permission-child",
-        .persistent,
-        "model/permission",
-        types.ReasoningEffort.literal("medium"),
-        &.{"permission-work"},
-    );
-    try env.setPermissionMode(alloc, "permission-child", .ask);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "permission-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "permission-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-    {
-        var source = try env.tmp.dir.createFile(
-            io_mod.getIo(),
-            "workspace/source.txt",
-            .{ .truncate = true },
-        );
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const destination = try std.fs.path.join(
-        alloc,
-        &.{ env.home, "destination.txt" },
-    );
-    defer alloc.free(destination);
-    const arguments = if (std.mem.eql(u8, tool_name, "copy_file"))
-        try std.fmt.allocPrint(
-            alloc,
-            "{{\"source\":\"source.txt\",\"destination\":\"{s}\"}}",
-            .{destination},
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "{{\"old_path\":\"source.txt\",\"new_path\":\"{s}\"}}",
-            .{destination},
-        );
-    defer alloc.free(arguments);
-
-    var host = LiveRevalidationHost{
-        .tool_name = tool_name,
-        .source_pattern = "source.txt",
-        .destination_pattern = destination,
-    };
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = approval_persistence.DurableRegistry{
-        .alloc = alloc,
-        .sessions = &env.store,
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "permission-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "permission-child";
-    turn.active_work_id = "permission-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = try std.fs.path.join(
-        alloc,
-        &.{ env.workspace, "source.txt" },
-    );
-    defer alloc.free(@constCast(hooks.permission_target));
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{.{ .result = .{ .model_output = "effect" } }};
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "generation-bound-action",
-        .name = tool_name,
-        .arguments_json = arguments,
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    // This fixture exercises live human-approval revalidation, not automatic
-    // recovery. Start it in ask mode so the initial approval is intentional.
-    job.permission_mode = .ask;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestCancel();
-        thread.join();
-    };
-    const approval_id = try waitForPendingToolApproval(
-        alloc,
-        &env,
-        "permission-child",
-    );
-    defer alloc.free(approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(changed_action);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            approval_id,
-            "permission-child",
-            approval_decision,
-            null,
-            3,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    const expected_effects: usize = if (changed_action == .ask) 1 else 0;
-    try std.testing.expectEqual(
-        expected_effects,
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    var ledger = try env.loadCommunication(alloc, "permission-child");
-    defer ledger.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), ledger.approvals.len);
-    try std.testing.expectEqual(
-        if (approval_decision == .always)
-            communication.ApprovalStatus.allowed_always
-        else
-            communication.ApprovalStatus.allowed_once,
-        ledger.approvals[0].status,
-    );
-}
-
-test "production child action revalidation checks changed copy and rename destinations" {
-    for ([_][]const u8{ "copy_file", "rename_file" }) |tool_name| {
-        try runProductionActionGenerationCase(
-            tool_name,
-            .ask,
-            if (std.mem.eql(u8, tool_name, "rename_file")) .always else .once,
-        );
-        try runProductionActionGenerationCase(tool_name, .deny, .once);
-    }
 }
 
 const GatewayExecution = struct {
@@ -8949,6 +8603,33 @@ test "completed one off reconciles one stable final result message" {
         "one-off-child",
         .{},
     )) == null);
+}
+
+test "final result delivery is mandatory for one off and model-created persistent children" {
+    var record = try testRecord(std.testing.allocator, .persistent, &.{});
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expect(!shouldReconcileFinalResult(record));
+
+    const replacement = try std.testing.allocator.alloc(domain.OperationReceipt, 1);
+    std.testing.allocator.free(record.operations);
+    record.operations = replacement;
+    record.operations[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000"),
+        .request_fingerprint = [_]u8{0} ** 32,
+        .fingerprint = [_]u8{0} ** 32,
+        .code = .created,
+        .target_id = try std.testing.allocator.dupe(u8, "persistent-child"),
+        .generation = 1,
+        .event_sequence = 1,
+        .identity_source = .model,
+        .identity_epoch = 1,
+    };
+    try std.testing.expect(shouldReconcileFinalResult(record));
+
+    record.operations[0].identity_source = .human;
+    try std.testing.expect(!shouldReconcileFinalResult(record));
+    record.mode = .one_off;
+    try std.testing.expect(shouldReconcileFinalResult(record));
 }
 
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {

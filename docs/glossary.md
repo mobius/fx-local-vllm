@@ -105,3 +105,9 @@
 | focused Windows smoke root | focused Windows smoke root；面向 Windows 可运行能力的独立 Zig 测试入口，通过真实构建二进制验证公开命令，不实例化平台不支持的 Unix 测试夹具。 |
 | POSIX full registry | POSIX full registry；上游为 Unix 进程、PTY、poll 和 signal 语义准备的全量测试注册表，不能直接等价移植到 Windows。 |
 | test root module | test root module；Zig 测试编译的根模块，决定哪些源文件和测试声明被实例化；本轮 Windows 与 POSIX 使用不同根模块。 |
+| upstream tracking | 上游跟踪；定期刷新 canonical upstream 并比较本地 fork 的提交、文件和合并风险，不等同于自动合入。 |
+| managed shell execution | 受管理 shell 执行；由 fx 统一控制 shell 子进程的权限、生命周期、恢复和结果记录。 |
+| process identity | 进程身份；用于把运行中的子进程、持久化记录和恢复操作绑定到同一个真实进程。 |
+| terminal outcome integrity | 终端结果完整性；即使执行或恢复路径发生异常，也保留终端的最终状态和输出语义。 |
+| rapid-exit handoff | 快速退出交接；进程即将退出时，把恢复所需的 session、shell 或 terminal 状态交给后续执行者。 |
+| terminal transcript lineage | 终端 transcript 谱系；记录终端输出片段与 session、恢复和子 agent 来源之间的关系。 |
